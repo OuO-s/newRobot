@@ -704,12 +704,13 @@
     <!-- ============== 底盘 ============== -->
     <section id="tab-chassis" class="panel">
       <div class="chassis-conn">
-        <label>底盘 IP <input id="chassisHost" value="192.168.1.20" size="14" /></label>
-        <label>端口 <input id="chassisPort" type="number" value="14444" size="6" /></label>
+        <label>底盘 IP <input id="chassisHost" value="192.168.2.2" size="14" /></label>
+        <label>端口 <input id="chassisPort" type="number" value="1448" size="6" /></label>
         <button id="btnChConn" class="primary">连接</button>
         <button id="btnChDisc">断开</button>
         <button id="btnChCancel">⏹ 取消动作</button>
         <button id="btnChRefreshMap" class="primary">刷新地图</button>
+        <button id="btnChReloc">📍 重定位</button>
         <span id="chStatus" class="badge off">未连接</span>
       </div>
       <div class="chassis-body">
@@ -717,10 +718,14 @@
           <h3>地图 (点击导航)</h3>
           <div class="map-frame">
             <img id="mapImg" alt="map" />
+            <canvas id="mapOverlay"></canvas>
           </div>
           <div class="map-info">
             <span>位姿:</span><span id="poseLine">-</span>
             <span>激光:</span><span id="laserCount">0</span> 点
+            <span>电量:</span><span id="battLine">-</span>
+            <span>健康:</span><span id="healthLine">-</span>
+            <span>动作:</span><span id="actionLine">-</span>
           </div>
         </div>
         <div class="chassis-side">
@@ -750,6 +755,31 @@
               <button data-dir="1">↓</button>
             </div>
             <label>时长(ms) <input id="jsDur" type="number" value="500" /></label>
+          </div>
+          <div class="card">
+            <h3>定位与地图</h3>
+            <button id="btnChRelocalize" class="primary">🔄 自动重定位</button>
+            <button id="btnChMapSave">💾 保存地图(stcm)</button>
+            <button id="btnChMapReload">📂 重载地图(stcm)</button>
+            <button id="btnChMapMode">🗺 建图模式: 关</button>
+            <p class="hint">自动重定位 = 底盘原地旋转扫描重建定位;保存/重载操作设备内置 stcm(RoboStudio 建的图与禁止区域都存在里面),不影响手动 📍 重定位;建图模式开启后移动会持续更新地图(重扫场地图用,完成后记得保存 stcm)</p>
+          </div>
+          <div class="card">
+            <h3>RoboStudio 点位</h3>
+            <div id="poiList"><p class="hint">连接后随地图加载</p></div>
+          </div>
+          <div class="card">
+            <h3>轨道(网页自建)</h3>
+            <select id="trackSel"></select>
+            <button id="btnTrackRec">➕ 录制</button>
+            <button id="btnTrackClear">清空编辑</button>
+            <button id="btnTrackSave">💾 保存</button>
+            <button id="btnTrackDel">🗑 删除</button>
+            <label>停在第
+              <input id="trackStopIdx" type="number" min="1" style="width:4em" placeholder="末点" />
+              点</label>
+            <button id="btnTrackGo" class="primary">▶ 沿轨移动</button>
+            <div id="trackStatus" class="hint">RoboStudio 的轨道不开放接口,网页自建:点「录制」后在地图上依次点击加路点</div>
           </div>
         </div>
       </div>

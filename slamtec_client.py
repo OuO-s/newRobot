@@ -19,6 +19,7 @@ ACTION_MOVE_TO = "slamtec.agent.actions.MoveToAction"
 ACTION_MOVE_BY = "slamtec.agent.actions.MoveByAction"
 ACTION_ROTATE_TO = "slamtec.agent.actions.RotateToAction"
 ACTION_GO_HOME = "slamtec.agent.actions.GoHomeAction"
+ACTION_MANUAL_RELOC = "slamtec.agent.actions.ManualRelocalizationAction"
 
 
 class SlamtecChassis:
@@ -101,6 +102,20 @@ class SlamtecChassis:
         }).json()
         return int(payload.get("action_id", -1))
 
+    def relocalize(self) -> int:
+        """自动重定位:底盘主动旋转/扫描匹配重建定位(机器人会原地转动)。"""
+        payload = self._request("POST", "/api/core/motion/v1/actions", {
+            "action_name": ACTION_MANUAL_RELOC}).json()
+        return int(payload.get("action_id", -1))
+
+    def save_map(self) -> None:
+        """把当前运行时地图持久化为设备内置 stcm(覆盖上次保存)。"""
+        self._request("POST", "/api/multi-floor/map/v1/stcm/:save", {})
+
+    def reload_map(self) -> None:
+        """用设备内置 stcm 重载运行时地图(当前地图被覆盖)。"""
+        self._request("POST", "/api/multi-floor/map/v1/stcm/:reload", {})
+
     def get_action(self, action_id: int) -> dict:
         """查询 Action 状态:{action_id, stage, state:{status, result, reason}}。"""
         return self._request("GET", f"/api/core/motion/v1/actions/{action_id}").json()
@@ -129,6 +144,39 @@ class SlamtecChassis:
     def get_laserscan(self) -> dict:
         """当前激光帧 {pose:{x,y,yaw...}, laser_points:[{angle,distance,valid}]}。"""
         return self._request("GET", "/api/core/system/v1/laserscan").json()
+
+    def get_pois(self) -> list:
+        """RoboStudio 存的点位(兴趣点):[{id, metadata:{display_name}, pose}]。"""
+        return self._request("GET", "/api/core/artifact/v1/pois").json()
+
+    def get_homedocks(self) -> list:
+        """充电桩位列表,结构同 POI。"""
+        return self._request("GET", "/api/core/slam/v1/homedocks").json()
+
+    def get_power_status(self) -> dict:
+        """电源状态: {batteryPercentage, isCharging, dockingStatus, powerStage, ...}。"""
+        return self._request("GET", "/api/core/system/v1/power/status").json()
+
+    def get_health(self) -> dict:
+        """健康状态: {hasError, hasFatal, hasWarning, hasLidarDisconnected, ...}。"""
+        return self._request("GET", "/api/core/system/v1/robot/health").json()
+
+    def get_speed(self) -> dict:
+        """当前速度: {vx, vy, omega}。"""
+        return self._request("GET", "/api/core/motion/v1/speed").json()
+
+    def get_current_action(self) -> dict | None:
+        """当前运动行为;空闲(404)返回 None。"""
+        try:
+            return self._request("GET", "/api/core/motion/v1/actions/:current").json()
+        except SlamtecError as e:
+            if "HTTP 404" in str(e):
+                return None
+            raise
+
+    def set_mapping_enabled(self, enable: bool) -> None:
+        """开/关建图模式(开启后移动会持续更新地图)。"""
+        self._request("PUT", "/api/core/slam/v1/mapping/:enable", {"enable": bool(enable)})
 
     def get_robot_info(self) -> dict:
         return self._request("GET", "/api/core/system/v1/robot/info").json()

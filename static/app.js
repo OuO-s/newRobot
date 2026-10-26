@@ -93,6 +93,19 @@ const API = {
   chHome:        (dock) => post('/api/chassis/go_home', { dock }),
   chCancel:      () => post('/api/chassis/cancel', {}),
   chJoystick:    (dir, dur) => post('/api/chassis/joystick', { direction: dir, duration_ms: dur }),
+  chSetPose:     (x, y, yaw) => post('/api/chassis/set_pose', { x, y, yaw }),
+  chRelocalize:  () => post('/api/chassis/relocalize', {}),
+  chMapSave:     () => post('/api/chassis/map_save', {}),
+  chMapReload:   () => post('/api/chassis/map_reload', {}),
+  chPois:        () => fetch('/api/chassis/pois').then(r => r.json()),
+  chDocks:       () => fetch('/api/chassis/homedocks').then(r => r.json()),
+  chPower:       () => fetch('/api/chassis/power').then(r => r.json()),
+  chHealth:      () => fetch('/api/chassis/health').then(r => r.json()),
+  chActionCur:   () => fetch('/api/chassis/action_current').then(r => r.json()),
+  chActionGet:   (id) => fetch('/api/chassis/action/' + id).then(r => r.json()),
+  chMapping:     (enable) => post('/api/chassis/mapping', { enable }),
+  chTracksGet:   () => fetch('/api/chassis/tracks').then(r => r.json()),
+  chTracksSave:  (tracks) => post('/api/chassis/tracks', { tracks }),
 };
 
 async function post(url, body) {
@@ -1353,13 +1366,161 @@ document.getElementById('btnChDisc').addEventListener('click', async () => {
   $chStatus.textContent = '未连接';
   $chStatus.className = 'badge off';
   $mapImg.src = '';
+  chMapInfo = null;
+  $mapOverlay.getContext('2d').clearRect(0, 0, $mapOverlay.width, $mapOverlay.height);
   stopChassisLoop();
 });
 document.getElementById('btnChCancel').addEventListener('click', async () => {
+  chTrackAbort = true;   // 沿轨链同时中止
   try { await API.chCancel(); toast('已取消动作', 'success'); }
   catch (e) { toast('取消失败: ' + e.message, 'error'); }
 });
 document.getElementById('btnChRefreshMap').addEventListener('click', () => refreshMap(true));
+document.getElementById('btnChRelocalize').addEventListener('click', async () => {
+  if (!$chStatus.classList.contains('on')) { toast('底盘未连接', 'error'); return; }
+  if (!confirm('自动重定位:机器人将原地旋转扫描重建定位,确认执行?')) return;
+  try { await API.chRelocalize(); toast('已下发自动重定位', 'success'); }
+  catch (e) { toast('自动重定位失败: ' + e.message, 'error'); }
+});
+document.getElementById('btnChMapSave').addEventListener('click', async () => {
+  if (!$chStatus.classList.contains('on')) { toast('底盘未连接', 'error'); return; }
+  if (!confirm('把当前地图保存为设备 stcm(会覆盖上次保存的版本,含禁止区域)?')) return;
+  try { await API.chMapSave(); toast('地图已保存到设备', 'success'); }
+  catch (e) { toast('保存失败: ' + e.message, 'error'); }
+});
+document.getElementById('btnChMapReload').addEventListener('click', async () => {
+  if (!$chStatus.classList.contains('on')) { toast('底盘未连接', 'error'); return; }
+  if (!confirm('用设备里的 stcm 覆盖当前地图(RoboStudio 建的图+禁止区域)?定位以重载后的图为准')) return;
+  try { await API.chMapReload(); toast('已重载,正在刷新地图…', 'success'); refreshMap(true); }
+  catch (e) { toast('重载失败: ' + e.message, 'error'); }
+});
+let chMapModeOn = false;
+document.getElementById('btnChMapMode').addEventListener('click', async () => {
+  if (!$chStatus.classList.contains('on')) { toast('底盘未连接', 'error'); return; }
+  const to = !chMapModeOn;
+  if (!confirm(to ? '开启建图模式:之后遥控/导航移动会持续更新运行时地图(改完记得保存 stcm,否则重启丢失)?'
+                  : '关闭建图模式?')) return;
+  try {
+    await API.chMapping(to);
+    chMapModeOn = to;
+    document.getElementById('btnChMapMode').textContent = `🗺 建图模式: ${to ? '开' : '关'}`;
+    toast(to ? '建图模式已开启,开始遥控走一圈,完成后保存地图' : '建图模式已关闭', 'success');
+  } catch (e) { toast('建图模式切换失败: ' + e.message, 'error'); }
+});
+
+// ===== 轨道(网页自建) =====
+const $trackSel = document.getElementById('trackSel');
+function setTrackStatus(msg) {
+  document.getElementById('trackStatus').textContent = msg;
+}
+function renderTrackSel(selName) {
+  $trackSel.innerHTML = '<option value="">(新轨道)</option>';
+  for (const t of chTracks) {
+    const opt = document.createElement('option');
+    opt.value = opt.textContent = t.name;
+    $trackSel.appendChild(opt);
+  }
+  $trackSel.value = selName || '';
+}
+$trackSel.addEventListener('change', () => {
+  const t = chTracks.find(x => x.name === $trackSel.value);
+  chTrackPts = t ? t.points.map(p => ({ ...p })) : [];
+  setTrackStatus(t ? `轨道「${t.name}」: ${t.points.length} 点(可继续点地图加点/直接沿轨移动)`
+                   : 'RoboStudio 的轨道不开放接口,网页自建:点「录制」后在地图上依次点击加路点');
+});
+document.getElementById('btnTrackRec').addEventListener('click', () => {
+  if (!$chStatus.classList.contains('on')) { toast('底盘未连接', 'error'); return; }
+  if (!chMapInfo) { toast('地图未加载', 'error'); return; }
+  chTrackRecMode = !chTrackRecMode;
+  const btn = document.getElementById('btnTrackRec');
+  btn.textContent = chTrackRecMode ? '⏹ 结束录制' : '➕ 录制';
+  btn.classList.toggle('primary', chTrackRecMode);
+  if (chTrackRecMode && !chTrackPts.length)
+    setTrackStatus('录制中:点击地图依次加路点(起点=机器人当前位置附近建议手动先导航/或直接点)');
+});
+document.getElementById('btnTrackClear').addEventListener('click', () => {
+  if (!chTrackPts.length) { toast('编辑中没有路点', 'info'); return; }
+  if (!confirm(`清空当前编辑的 ${chTrackPts.length} 个路点?`)) return;
+  chTrackPts = [];
+  setTrackStatus('已清空,可重新录制');
+});
+document.getElementById('btnTrackSave').addEventListener('click', async () => {
+  if (!chTrackPts.length) { toast('没有路点可保存', 'error'); return; }
+  let name = $trackSel.value;
+  if (!name) {
+    name = (prompt('轨道名称:') || '').trim();
+    if (!name) return;
+  }
+  const exist = chTracks.find(x => x.name === name);
+  if (exist && !confirm(`覆盖已有轨道「${name}」(${exist.points.length} 点)?`)) return;
+  if (exist) exist.points = chTrackPts.map(p => ({ ...p }));
+  else chTracks.push({ name, points: chTrackPts.map(p => ({ ...p })) });
+  try {
+    await API.chTracksSave(chTracks);
+    renderTrackSel(name);
+    setTrackStatus(`已保存「${name}」: ${chTrackPts.length} 点`);
+    toast('轨道已保存', 'success');
+  } catch (e) { toast('保存失败: ' + e.message, 'error'); }
+});
+document.getElementById('btnTrackDel').addEventListener('click', async () => {
+  const name = $trackSel.value;
+  if (!name) { toast('请先在下拉框选择要删除的轨道', 'error'); return; }
+  if (!confirm(`删除轨道「${name}」?`)) return;
+  chTracks = chTracks.filter(x => x.name !== name);
+  try {
+    await API.chTracksSave(chTracks);
+    chTrackPts = [];
+    renderTrackSel('');
+    setTrackStatus('已删除');
+  } catch (e) { toast('删除失败: ' + e.message, 'error'); }
+});
+document.getElementById('btnTrackGo').addEventListener('click', async () => {
+  if (!$chStatus.classList.contains('on')) { toast('底盘未连接', 'error'); return; }
+  if (!chTrackPts.length) { toast('没有路点:先选轨道或录制', 'error'); return; }
+  let stop = parseInt(document.getElementById('trackStopIdx').value, 10);
+  if (Number.isNaN(stop) || stop < 1) stop = chTrackPts.length;
+  stop = Math.min(stop, chTrackPts.length);
+  const name = $trackSel.value || '(未命名)';
+  if (!confirm(`沿轨道「${name}」按顺序经过 ${stop} 个路点,停在第 ${stop} 点?\n中途可随时「取消动作」中止`)) return;
+  chTrackAbort = false;
+  for (let i = 0; i < stop; i++) {
+    if (chTrackAbort) break;
+    const pt = chTrackPts[i];
+    chTrackRunIdx = i;
+    setTrackStatus(`沿轨执行: 第 ${i + 1}/${stop} 点 (${fmt(pt.x, 2)}, ${fmt(pt.y, 2)})…`);
+    try {
+      const r = await API.chMoveTo(pt.x, pt.y, pt.yaw ?? null);
+      const ok = await waitTrackAction(r.action_id);
+      if (!ok || chTrackAbort) { setTrackStatus('沿轨已中止'); break; }
+      setTrackStatus(`已到第 ${i + 1}/${stop} 点`);
+    } catch (e) {
+      setTrackStatus('沿轨失败: ' + e.message);
+      toast(`第 ${i + 1} 点导航下发失败,链已停: ` + e.message, 'error');
+      break;
+    }
+  }
+  chTrackRunIdx = -1;
+  if (!chTrackAbort) { setTrackStatus('沿轨完成 ✓'); toast('沿轨移动完成', 'success'); }
+});
+async function waitTrackAction(actionId, timeoutMs = 180000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    if (chTrackAbort) return false;
+    await new Promise(r => setTimeout(r, 500));
+    let a = null;
+    try { a = (await API.chActionGet(actionId)).action; } catch {}
+    if (!a) return true;    // 查不到(已结束被清理)按完成处理
+    const st = a.state?.status ?? a.status;
+    if (typeof st === 'number' && st <= 3) continue;   // 0新建/1执行/3暂停 → 继续等
+    if (typeof st === 'string' && /run|wait|new|start|pend/i.test(st)) continue;
+    console.log('track action done:', JSON.stringify(a.state || a));
+    return true;
+  }
+  toast('该段超时(3 分钟未完成),链已停', 'error');
+  return false;
+}
+// 启动时拉取已存轨道
+API.chTracksGet().then(d => { chTracks = d.tracks || []; renderTrackSel(''); }).catch(() => {});
 document.getElementById('btnChMove').addEventListener('click', async () => {
   const x = parseFloat(document.getElementById('mvX').value);
   const y = parseFloat(document.getElementById('mvY').value);
@@ -1388,13 +1549,123 @@ document.querySelectorAll('.joystick button').forEach(btn => {
   });
 });
 
+// 地图元数据(后端 /api/chassis/map_info),用于世界坐标 ↔ 图片像素换算
+let chMapInfo = null;
+const $mapOverlay = document.getElementById('mapOverlay');
+
+function sizeMapOverlay() {
+  if ($mapImg.clientWidth) {
+    $mapOverlay.width = $mapImg.clientWidth;
+    $mapOverlay.height = $mapImg.clientHeight;
+  }
+}
+window.addEventListener('resize', sizeMapOverlay);
+
+// 世界坐标 → 叠加层像素(数据第 0 行 = 最高 y,与 img 渲染方向一致)
+function chWorldToPx(wx, wy) {
+  const s = $mapOverlay.width / chMapInfo.xsize;
+  return [(wx - chMapInfo.x0) / chMapInfo.resolution * s,
+          (chMapInfo.ysize - (wy - chMapInfo.y0) / chMapInfo.resolution) * s];
+}
+
+function drawChassisOverlay(p, laser) {
+  if (!chMapInfo || !$mapOverlay.width) return;
+  const ctx = $mapOverlay.getContext('2d');
+  ctx.clearRect(0, 0, $mapOverlay.width, $mapOverlay.height);
+  // 激光点(角度相对机器人正前方,逆时针为正)
+  ctx.fillStyle = '#2f7fe0';
+  const cy = Math.cos(p.yaw), sy = Math.sin(p.yaw);
+  for (const pt of (laser.laser_points || [])) {
+    if (pt.valid === false) continue;
+    const lx = pt.distance * Math.cos(pt.angle), ly = pt.distance * Math.sin(pt.angle);
+    const [sx, syp] = chWorldToPx(p.x + lx * cy - ly * sy, p.y + lx * sy + ly * cy);
+    ctx.fillRect(sx - 1, syp - 1, 2.2, 2.2);
+  }
+  // 机器人位姿箭头(屏幕 y 向下,朝向角取反)
+  const [rx, ry] = chWorldToPx(p.x, p.y);
+  ctx.save();
+  ctx.translate(rx, ry);
+  ctx.rotate(-p.yaw);
+  ctx.fillStyle = '#e0483e';
+  ctx.beginPath();
+  ctx.moveTo(10, 0); ctx.lineTo(-7, 6); ctx.lineTo(-7, -6); ctx.closePath(); ctx.fill();
+  ctx.restore();
+  // RoboStudio 点位标记(绿点+名称)
+  ctx.font = 'bold 12px sans-serif';
+  ctx.textBaseline = 'middle';
+  for (const poi of chPoisList) {
+    const name = poi.metadata?.display_name || poi.id.slice(0, 6);
+    const [mx, my] = chWorldToPx(poi.pose.x, poi.pose.y);
+    ctx.fillStyle = '#2ecc71';
+    ctx.beginPath(); ctx.arc(mx, my, 5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#d8ffe8';
+    ctx.fillText(name, mx + 8, my);
+  }
+  // 充电桩标记(紫方块+⚡)
+  for (const dock of chDocksList) {
+    const [mx, my] = chWorldToPx(dock.pose.x, dock.pose.y);
+    ctx.fillStyle = '#b06ee0';
+    ctx.fillRect(mx - 5, my - 5, 10, 10);
+    ctx.fillStyle = '#f2e2ff';
+    ctx.fillText('⚡桩', mx + 8, my);
+  }
+  // 自建轨道:折线+序号,执行中当前目标点高亮
+  if (chTrackPts.length) {
+    const ptsPx = chTrackPts.map(pt => chWorldToPx(pt.x, pt.y));
+    ctx.strokeStyle = '#f0a03a';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    ptsPx.forEach(([px, py], i) => i ? ctx.lineTo(px, py) : ctx.moveTo(px, py));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ptsPx.forEach(([px, py], i) => {
+      const active = (i === chTrackRunIdx);
+      ctx.fillStyle = active ? '#ffd24d' : '#f0a03a';
+      ctx.beginPath(); ctx.arc(px, py, active ? 7 : 5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#1b1f26';
+      ctx.fillText(String(i + 1), px, py);
+    });
+  }
+}
+
+// 重定位模式:点击地图把机器人当前位置标到点击处(朝向保持当前值)
+let chRelocMode = false;
+let chLastPose = null;
+const $btnChReloc = document.getElementById('btnChReloc');
+$btnChReloc.addEventListener('click', () => {
+  if (!$chStatus.classList.contains('on')) { toast('底盘未连接', 'error'); return; }
+  chRelocMode = !chRelocMode;
+  $btnChReloc.classList.toggle('primary', chRelocMode);
+  $btnChReloc.textContent = chRelocMode ? '📍 点击地图设定位置(取消)' : '📍 重定位';
+  if (chRelocMode) toast('请点击地图上机器人实际所在的位置', 'info');
+});
+
 $mapImg.addEventListener('click', async (e) => {
   if (!$chStatus.classList.contains('on')) { toast('底盘未连接', 'error'); return; }
+  if (!chMapInfo) { toast('地图未加载', 'error'); return; }
   const rect = $mapImg.getBoundingClientRect();
-  const px = (e.clientX - rect.left) / rect.width;
-  const py = (e.clientY - rect.top) / rect.height;
-  const x = +(px - 0.5).toFixed(2);
-  const y = +((1 - py) - 0.5).toFixed(2);
+  const u = (e.clientX - rect.left) / rect.width;
+  const v = (e.clientY - rect.top) / rect.height;
+  const x = +(chMapInfo.x0 + u * chMapInfo.xsize * chMapInfo.resolution).toFixed(2);
+  const y = +(chMapInfo.y0 + (1 - v) * chMapInfo.ysize * chMapInfo.resolution).toFixed(2);
+  if (chRelocMode) {
+    const yaw = chLastPose ? chLastPose.yaw : 0;
+    if (!confirm(`把机器人当前位置设为 (${x}, ${y}),朝向保持 ${fmt(yaw, 2)} rad?`)) return;
+    try {
+      await API.chSetPose(x, y, yaw);
+      toast('已重定位', 'success');
+      chRelocMode = false;
+      $btnChReloc.classList.remove('primary');
+      $btnChReloc.textContent = '📍 重定位';
+    } catch (err) { toast('重定位失败: ' + err.message, 'error'); }
+    return;
+  }
+  if (chTrackRecMode) {
+    chTrackPts.push({ x, y, yaw: null });
+    setTrackStatus(`录制中:已加第 ${chTrackPts.length} 点 (${x}, ${y}),继续点击地图加点,完成后点「结束录制」`);
+    return;
+  }
   if (!confirm(`导航到 (${x}, ${y})?`)) return;
   try { await API.chMoveTo(x, y, null); toast('已下发导航', 'success'); }
   catch (err) { toast('导航失败: ' + err.message, 'error'); }
@@ -1403,25 +1674,97 @@ $mapImg.addEventListener('click', async (e) => {
 async function refreshMap(force = false) {
   if (!$chStatus.classList.contains('on')) return;
   try {
+    chMapInfo = await fetch('/api/chassis/map_info').then(r => r.json());
     const blob = await API.chMap(force);
     if ($mapImg.src) URL.revokeObjectURL($mapImg.src);
     $mapImg.src = URL.createObjectURL(blob);
+    $mapImg.onload = sizeMapOverlay;
   } catch (e) { console.warn('地图加载失败:', e); }
+  API.chPois().then(d => { chPoisList = d.pois || []; renderPoiList(); })
+    .catch(() => {});
+  API.chDocks().then(d => { chDocksList = d.docks || []; }).catch(() => {});
+}
+
+let chPoisList = [];
+let chDocksList = [];
+// 轨道状态:chTrackPts=编辑中的点,chTrackRunIdx=沿轨执行中当前目标(-1 空闲)
+let chTracks = [];
+let chTrackPts = [];
+let chTrackRecMode = false;
+let chTrackRunIdx = -1;
+let chTrackAbort = false;
+function renderPoiList() {
+  const box = document.getElementById('poiList');
+  if (!chPoisList.length) {
+    box.innerHTML = '<p class="hint">无点位(在 RoboStudio 里添加后刷新地图)</p>';
+    return;
+  }
+  box.innerHTML = '';
+  for (const poi of chPoisList) {
+    const name = poi.metadata?.display_name || poi.id.slice(0, 6);
+    const { x, y, yaw } = poi.pose;
+    const btn = document.createElement('button');
+    btn.textContent = `🎯 ${name}  (${fmt(x, 2)}, ${fmt(y, 2)})`;
+    btn.title = `导航到 ${name}: x=${fmt(x,2)} y=${fmt(y,2)} yaw=${fmt(yaw,2)}`;
+    btn.addEventListener('click', async () => {
+      if (!confirm(`导航到点位「${name}」(${fmt(x, 2)}, ${fmt(y, 2)}, 朝向 ${fmt(yaw, 2)} rad)?`)) return;
+      try { await API.chMoveTo(x, y, yaw); toast(`已导航到 ${name}`, 'success'); }
+      catch (e) { toast('导航失败: ' + e.message, 'error'); }
+    });
+    box.appendChild(btn);
+  }
 }
 
 let chTimer = null;
+let chSlowTick = 0;
+const ACTION_STATUS = { 0: '新建', 1: '执行中', 2: '等待', 3: '暂停', 4: '结束' };
 function startChassisLoop() {
   stopChassisLoop();
+  chSlowTick = 0;
   chTimer = setInterval(async () => {
     try {
       const p = await API.chPose();
       const l = await API.chLaser();
       if (p && typeof p === 'object') {
+        if (typeof p.x === 'number') chLastPose = p;
         document.getElementById('poseLine').textContent =
           `x=${fmt(p.x, 2)} y=${fmt(p.y, 2)} yaw=${fmt(p.yaw, 3)}`;
+        drawChassisOverlay(p, l);
       }
       document.getElementById('laserCount').textContent = (l.laser_points || []).length;
     } catch {}
+    // 当前动作(1s)与电量/健康(5s)
+    API.chActionCur().then(d => {
+      const a = d.action;
+      if (!a) {
+        document.getElementById('actionLine').textContent = '空闲';
+        return;
+      }
+      const name = (a.action_name || '').split('.').pop().replace(/Action$/, '')
+        || ('#' + a.action_id);
+      const st = a.state?.status ?? a.status;
+      document.getElementById('actionLine').textContent =
+        `${name} ${ACTION_STATUS[st] ?? st ?? ''}`;
+    }).catch(() => {});
+    if (++chSlowTick % 5 === 1) {
+      API.chPower().then(p => {
+        let s = `${p.batteryPercentage ?? '?'}%`;
+        if (p.isCharging) s += ' ⚡充电中';
+        else if (p.dockingStatus && p.dockingStatus !== 'undocked') s += ` (${p.dockingStatus})`;
+        document.getElementById('battLine').textContent = s;
+      }).catch(() => {});
+      API.chHealth().then(h => {
+        const el = document.getElementById('healthLine');
+        if (h.hasFatal) { el.textContent = '⛔严重故障'; el.style.color = '#ff6b6b'; }
+        else if (h.hasError) { el.textContent = '❌有错误'; el.style.color = '#ff6b6b'; }
+        else if (h.hasWarning) { el.textContent = '⚠有告警'; el.style.color = '#ffd24d'; }
+        else {
+          el.textContent = '正常';
+          el.style.color = h.hasLidarDisconnected ? '#ff6b6b' : '';
+          if (h.hasLidarDisconnected) el.textContent = '正常(激光断连)';
+        }
+      }).catch(() => {});
+    }
   }, 1000);
 }
 function stopChassisLoop() { if (chTimer) { clearInterval(chTimer); chTimer = null; } }

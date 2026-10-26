@@ -251,3 +251,9 @@ table.flrpt td:nth-child(5), table.flrpt td:nth-child(6) { white-space: nowrap; 
 table.flrpt td:nth-child(1), table.flrpt td:nth-child(2) { white-space: nowrap; }
 table.flrpt tr.flrpt-sub td { background: #141922; }
 @media (max-width: 900px) { .fl-two { grid-template-columns: 1fr; } }
+
+/* 底盘地图叠加层:机器人位姿 + 激光 */
+#mapOverlay {
+  position: absolute; left: 0; top: 0;
+  pointer-events: none;
+}

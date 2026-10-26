@@ -16,6 +16,8 @@ GUI 以 bash -c "source /opt/ros/humble/setup.bash && exec python3 camera_bridge
 import argparse
 import json
 import os
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -109,7 +111,7 @@ OPTS = {"max_width": 0, "quality": 82}
 WD_CHECK_S = 30.0   # 检查周期
 WD_DRY_S = 45.0     # 单路无帧超过此时长算干涸(hub USB 自愈约 45s,别低于它)
 WD_GRACE_S = 90.0   # 启动宽限(等 DDS 发现/相机上电)
-WD_MAX_RESUB = 6    # 连续干涸重订次数上限,超过=participant 卡死 → 自重启进程
+WD_MAX_RESUB = 6    # 连续干涸重订次数上限,超过=participant 卡死 → 换新进程重启
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -202,6 +204,20 @@ class BridgeNode(Node):
                 (lambda m, c=cam: self._on_image(m, c)),
                 qos_profile_sensor_data)
 
+    def _relaunch_detached(self) -> None:
+        """用全新进程重启自己(升级动作)。
+
+        曾用 os.execv:不换 PID,FastDDS 按进程号派的发现端口也不变,
+        2026-10-26 实证 exec 57 次全部无效(相机热插拔后发布端重建类
+        失配,同 PID 的新 participant 依然发现不到发布端);而外部
+        kill+重拉(新 PID)秒恢复。故改为:派一个 detached 子进程,
+        等本进程死后以全新 PID 拉起本脚本,然后 SIGKILL 自己。
+        子进程继承本进程的 stdout(即 camera_bridge.log)。"""
+        cmd = (f"sleep 1.5; exec {sys.executable} "
+               f"{os.path.abspath(__file__)} {' '.join(sys.argv[1:])}")
+        subprocess.Popen(["/bin/bash", "-c", cmd], start_new_session=True)
+        os.kill(os.getpid(), signal.SIGKILL)
+
     def _watchdog(self) -> None:
         if time.monotonic() - self._t0 < WD_GRACE_S:
             return
@@ -225,10 +241,8 @@ class BridgeNode(Node):
             # participant;HTTP socket 是 CLOEXEC 不会泄漏给新进程。
             if self._dry_n >= WD_MAX_RESUB:
                 print("CAMERA_BRIDGE_WATCHDOG restart: resubscribe "
-                      "exhausted, re-exec process", flush=True)
-                os.execv(sys.executable,
-                         [sys.executable, os.path.abspath(__file__)]
-                         + sys.argv[1:])
+                      "exhausted, relaunch as fresh process", flush=True)
+                self._relaunch_detached()
             for sub in self._subs.values():
                 try:
                     self.destroy_subscription(sub)

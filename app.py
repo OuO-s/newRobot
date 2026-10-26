@@ -149,7 +149,7 @@ class ConnectBody(BaseModel):
 
 class ChassisConnectBody(BaseModel):
     host: str
-    port: int = 14444
+    port: int = 1448
 
 
 class LiftMoveBody(BaseModel):
@@ -209,6 +209,20 @@ class ChassisRotateBody(BaseModel):
 
 class ChassisGoHomeBody(BaseModel):
     dock: bool = True
+
+
+class ChassisSetPoseBody(BaseModel):
+    x: float
+    y: float
+    yaw: Optional[float] = None    # 缺省保持当前朝向
+
+
+class ChassisMappingBody(BaseModel):
+    enable: bool
+
+
+class ChassisTracksBody(BaseModel):
+    tracks: list[dict] = []    # [{name, points: [{x, y, yaw?}]}]
 
 
 class CameraStartBody(BaseModel):
@@ -853,23 +867,47 @@ async def chassis_map(refresh: bool = False):
         from PIL import Image
     except ImportError:
         raise _err("缺少 Pillow,请 pip install Pillow", 500)
+    # Slamware(Hermes) explore 图: 0=未知, 127=空闲, 1~126=障碍(墙);
+    # 数据第 0 行 = 最低 y(激光贴墙实测),渲染时上下翻转使显示图上方 = +y
     w, h = m["xsize"], m["ysize"]
     cells = m["data"]
-    img = Image.new("RGB", (w, h), (0x1a, 0x1d, 0x22))
+    img = Image.new("RGB", (w, h), (0x1b, 0x1f, 0x26))
     px = img.load()
     for y in range(h):
+        base = y * w
         for x in range(w):
-            v = cells[y * w + x]
-            if v == 0:
-                px[x, y] = (0x3a, 0x40, 0x48)
-            elif v == 1:
-                px[x, y] = (0xe8, 0xec, 0xef)
-            else:
-                px[x, y] = (0x1f, 0x1f, 0x1f)
+            v = cells[base + x]
+            if v == 127:
+                px[x, y] = (0x8a, 0x92, 0x9c)
+            elif v != 0:
+                px[x, y] = (0xf0, 0xf2, 0xf4)
     from io import BytesIO
     buf = BytesIO()
-    img.save(buf, "PNG")
+    img.transpose(Image.FLIP_TOP_BOTTOM).save(buf, "PNG")
     return StreamingResponse(iter([buf.getvalue()]), media_type="image/png")
+
+
+@app.get("/api/chassis/map_info")
+async def chassis_map_info():
+    """地图元数据,前端做世界坐标↔像素换算用。"""
+    if not STATE.chassis_service:
+        raise _err("底盘未连接", 409)
+    m = await _call(STATE.chassis_service.grid_map)
+    if not m:
+        raise _err("地图加载失败", 502)
+    return {"x0": m["x0"], "y0": m["y0"], "xsize": m["xsize"],
+            "ysize": m["ysize"], "resolution": m["resolution"]}
+
+
+@app.get("/api/chassis/pois")
+async def chassis_pois():
+    """RoboStudio 存的点位列表。"""
+    if not STATE.chassis_obj:
+        raise _err("底盘未连接", 409)
+    try:
+        return {"pois": await _call(STATE.chassis_obj.get_pois)}
+    except SlamtecError as e:
+        raise _err(str(e), 502)
 
 
 @app.post("/api/chassis/move_to")
@@ -927,6 +965,171 @@ async def chassis_go_home(body: ChassisGoHomeBody):
         return {"ok": True, "action_id": action_id}
     except SlamtecError as e:
         raise _err(str(e), 502)
+
+
+@app.post("/api/chassis/set_pose")
+async def chassis_set_pose(body: ChassisSetPoseBody):
+    """手动重定位:告诉底盘"我现在在地图的 (x, y, yaw)"。"""
+    if not STATE.chassis_obj:
+        raise _err("底盘未连接", 409)
+    try:
+        yaw = body.yaw
+        if yaw is None:
+            yaw = (await _call(STATE.chassis_service.pose) or {}).get("yaw", 0.0)
+        await _call(STATE.chassis_obj.set_pose, body.x, body.y, yaw)
+        return {"ok": True, "x": body.x, "y": body.y, "yaw": yaw}
+    except SlamtecError as e:
+        raise _err(str(e), 502)
+
+
+@app.post("/api/chassis/relocalize")
+async def chassis_relocalize():
+    """自动重定位:底盘原地旋转重建定位(会动,慎用)。"""
+    if not STATE.chassis_obj:
+        raise _err("底盘未连接", 409)
+    try:
+        action_id = await _call(STATE.chassis_obj.relocalize)
+        return {"ok": True, "action_id": action_id}
+    except SlamtecError as e:
+        raise _err(str(e), 502)
+
+
+@app.post("/api/chassis/map_save")
+async def chassis_map_save():
+    """当前运行时地图持久化为设备内置 stcm。"""
+    if not STATE.chassis_obj:
+        raise _err("底盘未连接", 409)
+    try:
+        await _call(STATE.chassis_obj.save_map)
+        return {"ok": True}
+    except SlamtecError as e:
+        raise _err(str(e), 502)
+
+
+@app.post("/api/chassis/map_reload")
+async def chassis_map_reload():
+    """用设备内置 stcm 覆盖当前运行时地图。"""
+    if not STATE.chassis_obj:
+        raise _err("底盘未连接", 409)
+    try:
+        await _call(STATE.chassis_obj.reload_map)
+        if STATE.chassis_service:
+            STATE.chassis_service.grid_map(refresh=True)
+        return {"ok": True}
+    except SlamtecError as e:
+        raise _err(str(e), 502)
+
+
+@app.get("/api/chassis/power")
+async def chassis_power():
+    """电量/充电状态。"""
+    if not STATE.chassis_obj:
+        raise _err("底盘未连接", 409)
+    try:
+        return await _call(STATE.chassis_obj.get_power_status)
+    except SlamtecError as e:
+        raise _err(str(e), 502)
+
+
+@app.get("/api/chassis/health")
+async def chassis_health():
+    """底盘健康状态。"""
+    if not STATE.chassis_obj:
+        raise _err("底盘未连接", 409)
+    try:
+        return await _call(STATE.chassis_obj.get_health)
+    except SlamtecError as e:
+        raise _err(str(e), 502)
+
+
+@app.get("/api/chassis/speed")
+async def chassis_speed():
+    """当前速度 {x, y, omega}。"""
+    if not STATE.chassis_obj:
+        raise _err("底盘未连接", 409)
+    try:
+        return await _call(STATE.chassis_obj.get_speed)
+    except SlamtecError as e:
+        raise _err(str(e), 502)
+
+
+@app.get("/api/chassis/homedocks")
+async def chassis_homedocks():
+    """充电桩位置列表。"""
+    if not STATE.chassis_obj:
+        raise _err("底盘未连接", 409)
+    try:
+        return {"docks": await _call(STATE.chassis_obj.get_homedocks)}
+    except SlamtecError as e:
+        raise _err(str(e), 502)
+
+
+@app.get("/api/chassis/action_current")
+async def chassis_action_current():
+    """当前运动行为;空闲返回 {"action": null}。"""
+    if not STATE.chassis_obj:
+        raise _err("底盘未连接", 409)
+    try:
+        return {"action": await _call(STATE.chassis_obj.get_current_action)}
+    except SlamtecError as e:
+        raise _err(str(e), 502)
+
+
+@app.get("/api/chassis/action/{action_id}")
+async def chassis_action(action_id: int):
+    """按 id 查询运动行为状态(404 → {"action": null})。"""
+    if not STATE.chassis_obj:
+        raise _err("底盘未连接", 409)
+    try:
+        return {"action": await _call(STATE.chassis_obj.get_action, action_id)}
+    except SlamtecError as e:
+        if "HTTP 404" in str(e):
+            return {"action": None}
+        raise _err(str(e), 502)
+
+
+@app.post("/api/chassis/mapping")
+async def chassis_mapping(body: ChassisMappingBody):
+    """开/关建图模式(开启后移动会持续更新运行时地图,建议配合保存 stcm)。"""
+    if not STATE.chassis_obj:
+        raise _err("底盘未连接", 409)
+    try:
+        await _call(STATE.chassis_obj.set_mapping_enabled, body.enable)
+        if STATE.chassis_service:
+            STATE.chassis_service.grid_map(refresh=True)
+        return {"ok": True, "enable": body.enable}
+    except SlamtecError as e:
+        raise _err(str(e), 502)
+
+
+# ---------------------------------------------------------------------------
+# 网页自建轨道(RoboStudio 的轨道不开放 REST,这里存本地 JSON)
+TRACKS_PATH = Path(__file__).resolve().parent / "chassis_tracks.json"
+
+
+@app.get("/api/chassis/tracks")
+async def chassis_tracks_get():
+    if TRACKS_PATH.exists():
+        try:
+            return json.loads(TRACKS_PATH.read_text("utf-8"))
+        except (ValueError, OSError):
+            pass
+    return {"tracks": []}
+
+
+@app.post("/api/chassis/tracks")
+async def chassis_tracks_save(body: ChassisTracksBody):
+    """整表保存(前端编辑后回传全部轨道)。"""
+    for t in body.tracks:
+        if not t.get("name") or not isinstance(t.get("points"), list):
+            raise _err("轨道格式: [{name, points: [{x, y, yaw?}]}]", 400)
+    try:
+        TRACKS_PATH.write_text(
+            json.dumps({"tracks": body.tracks}, ensure_ascii=False, indent=2),
+            "utf-8")
+    except OSError as e:
+        raise _err(f"轨道保存失败: {e}", 500)
+    return {"ok": True, "count": len(body.tracks)}
 
 
 # ===========================================================================
