@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# 运行时产物
+logs/
+resume_data/
+*.pid
+
+# 备份文件
+*.bak-*
+*.bak_*
+*.bak
+
+# 实验遗留的模型副本(未被代码引用, 正式权重在 models/)
+best.pt

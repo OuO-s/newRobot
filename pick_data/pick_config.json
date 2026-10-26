@@ -1,0 +1,67 @@
+{
+  "arm": "armleft",
+  "cam_role": "left",
+  "conf": 0.5,
+  "hover_mm": 6.0,
+  "motion_mode": "direct",
+  "cruise_clearance_mm": 40.0,
+  "press_mm": 10.0,
+  "max_press_mm": 10.0,
+  "hold_s": 2.0,
+  "ghost_min_z_mm": 200.0,
+  "layer_mm": 25.0,
+  "max_horiz_m": 0.45,
+  "max_dz_m": 0.25,
+  "xy_res_tol_mm": 8.0,
+  "z_res_tol_mm": 5.0,
+  "speed": 10,
+  "settle_s": 1.2,
+  "move_timeout_s": 60.0,
+  "vacuum": {
+    "mode": "manual",
+    "gripper_position": 0.0,
+    "gripper_velocity": 500
+  },
+  "residual_mm": [
+    3.51,
+    91.35,
+    -1.44
+  ],
+  "per_bag_residual_mm": {},
+  "scan_pose": {
+    "joints_deg": [
+      -80.947,
+      -86.16,
+      -90.538,
+      106.703,
+      3.766,
+      63.474,
+      0.144
+    ],
+    "end_pose": {
+      "position": [
+        -0.3046899650987594,
+        0.08020554354077326,
+        0.27556227044346326
+      ],
+      "orientation": [
+        0.7100498614910775,
+        -0.015703632998386972,
+        0.005310282951464284,
+        0.7039562422495658
+      ]
+    },
+    "created": "2026-10-21 15:23:30"
+  },
+  "align": {
+    "rpy_deg": [
+      90.74,
+      -1.99,
+      -1.05
+    ],
+    "z_ref_m": 0.2951,
+    "bag_order": 1,
+    "per_bag_only": false,
+    "created": "2026-10-23 15:29:56"
+  }
+}

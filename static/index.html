@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>天链机器人远程控制</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">🤖 天链机器人远程控制</div>
+    <div class="conn">
+      <label>整机 <input id="robotHost" value="192.168.2.201" size="14" /></label>
+      <button id="btnConnect" class="primary">连接</button>
+      <button id="btnDisconnect">断开</button>
+      <span id="connStatus" class="badge off">未连接</span>
+    </div>
+    <div class="gspeed" title="全局速度:双臂分别设定,页内所有臂运动(点动/示教回放/点位直达/吸取/流水线)均取此值,改动即时生效">
+      <span class="gspd-title">⚡ 全局速度</span>
+      <label>左臂
+        <input id="gspdL" type="range" min="1" max="100" value="15" step="1" />
+        <input id="gspdLn" type="number" min="1" max="100" value="15" size="2" />
+        <span class="gspd-unit">%</span>
+      </label>
+      <label>右臂
+        <input id="gspdR" type="range" min="1" max="100" value="15" step="1" />
+        <input id="gspdRn" type="number" min="1" max="100" value="15" size="2" />
+        <span class="gspd-unit">%</span>
+      </label>
+    </div>
+    <div class="actions">
+      <button id="btnEstop" class="danger" title="全局急停">⛔ 急停</button>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="status">📊 状态</button>
+    <button class="tab" data-tab="cart">🧭 笛卡尔移动</button>
+    <button class="tab" data-tab="joint-teach">📍 关节示教</button>
+    <button class="tab" data-tab="cart-teach">🛤️ 笛卡尔示教</button>
+    <button class="tab" data-tab="pose-lib">💾 点位复现</button>
+    <button class="tab" data-tab="pose-detect">🔍 物料检测</button>
+    <button class="tab" data-tab="flow">🦾 双臂流水线</button>
+    <button class="tab" data-tab="camera">📷 相机</button>
+    <button class="tab" data-tab="chassis">🚗 底盘</button>
+  </nav>
+
+  <main>
+    <!-- ============== 状态 ============== -->
+    <section id="tab-status" class="panel active">
+      <div class="cards">
+        <div class="card">
+          <h3>急停 / 升降 / 腰头</h3>
+          <div class="kv">
+            <span>急停</span><b id="em">-</b>
+            <span>升降 (m)</span><b id="lift">-</b>
+            <span>腰</span><b id="waist">-</b>
+            <span>头</span><b id="head">-</b>
+          </div>
+          <div class="row">
+            <button data-action="arm-power-on">双臂上电</button>
+            <button data-action="arm-power-off">双臂下电</button>
+          </div>
+          <div class="row">
+            <label>升降 +<input id="liftUpDist" type="number" step="0.01" value="0.05" size="5" /></label>
+            <button data-action="lift-up">↑</button>
+            <label>-<input id="liftDnDist" type="number" step="0.01" value="0.05" size="5" /></label>
+            <button data-action="lift-down">↓</button>
+            <button data-action="lift-stop">停</button>
+            <button data-action="lift-homing">回零</button>
+            <button data-action="lift-clear">清错</button>
+          </div>
+          <div class="row">
+            <label>腰<input id="waistAng" type="number" step="1" value="0" size="5" /></label>
+            <button data-action="waist-move">→</button>
+            <label>头<input id="headAng" type="number" step="1" value="0" size="5" /></label>
+            <button data-action="head-move">→</button>
+          </div>
+        </div>
+        <div class="card">
+          <h3>底盘位姿</h3>
+          <div class="kv">
+            <span>X</span><b id="cx">-</b>
+            <span>Y</span><b id="cy">-</b>
+            <span>Yaw</span><b id="cyaw">-</b>
+          </div>
+          <div class="muted" id="ikAvail">IK 状态探测中...</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>关节点动 — 按住持续平滑移动</h3>
+        <div class="row">
+          <label>机械臂
+            <select id="jogArm">
+              <option value="armleft">左臂</option>
+              <option value="armright">右臂</option>
+            </select>
+          </label>
+          <label>增量 (°/次)
+            <input id="jogStep" type="number" min="0.1" max="15" step="0.1" value="2" size="4" />
+          </label>
+          <label>发送周期 (ms)
+            <input id="jogPeriod" type="number" min="80" max="500" step="10" value="150" size="4" />
+          </label>
+          <label><input type="checkbox" id="jogZeroOrigin" /> 每次以 0° 为基准(微调)</label>
+        </div>
+        <table class="jogtab">
+          <thead>
+            <tr><th>关节</th><th>当前 (°)</th><th>−</th><th></th><th>+</th><th>绝对定位</th></tr>
+          </thead>
+          <tbody id="jogBody"></tbody>
+        </table>
+        <p class="muted">按住 − / + 持续平滑移动,松开或移开鼠标即停。软限位 ±175°。速度取顶栏全局速度(所选臂)。</p>
+        <div id="jogStatus" class="muted"></div>
+      </div>
+
+      <div class="card">
+        <h3>关节角 (°)</h3>
+        <table class="jtab">
+          <thead>
+            <tr><th></th><th>j1</th><th>j2</th><th>j3</th><th>j4</th><th>j5</th><th>j6</th><th>j7</th></tr>
+          </thead>
+          <tbody id="joints">
+            <tr><td colspan="8" class="muted">未连接</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h3>末端位姿 (位置 m / 四元数 / RPY °)</h3>
+        <div class="endposes">
+          <div><h4>左臂</h4><pre id="epLeft">-</pre></div>
+          <div><h4>右臂</h4><pre id="epRight">-</pre></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============== 笛卡尔移动 ============== -->
+    <section id="tab-cart" class="panel">
+      <div class="card">
+        <h3>当前末端位姿</h3>
+        <div class="row">
+          <label>机械臂
+            <select id="cartArm">
+              <option value="armleft">左臂</option>
+              <option value="armright">右臂</option>
+            </select>
+          </label>
+          <label>坐标系
+            <select id="cartFrame">
+              <option value="base">base 基座系</option>
+              <option value="tool">tool 工具系</option>
+            </select>
+          </label>
+          <label>平移步距 (mm)
+            <input id="cartStep" type="number" min="0.1" max="300" step="0.1" value="20" size="5" />
+          </label>
+          <label>旋转步距 (°)
+            <input id="cartRotStep" type="number" min="1" max="45" step="1" value="5" size="4" />
+          </label>
+          <label><input type="checkbox" id="cartSmooth" /> 平滑移动(按住连续)</label>
+          <button id="cartRefreshPose" class="primary">刷新位姿</button>
+        </div>
+        <pre id="cartCurrentPose" class="posebox">-</pre>
+      </div>
+
+      <div class="cards">
+        <div class="card">
+          <h3>平移点动</h3>
+          <div class="jog-grid">
+            <button data-cart="x-" class="jog">X-</button>
+            <button data-cart="x+" class="jog">X+</button>
+            <button data-cart="y-" class="jog">Y-</button>
+            <button data-cart="y+" class="jog">Y+</button>
+            <button data-cart="z-" class="jog">Z-</button>
+            <button data-cart="z+" class="jog">Z+</button>
+          </div>
+        </div>
+        <div class="card">
+          <h3>旋转点动 (需 IK)</h3>
+          <div class="jog-grid">
+            <button data-cart="rx-" class="jog">Rx-</button>
+            <button data-cart="rx+" class="jog">Rx+</button>
+            <button data-cart="ry-" class="jog">Ry-</button>
+            <button data-cart="ry+" class="jog">Ry+</button>
+            <button data-cart="rz-" class="jog">Rz-</button>
+            <button data-cart="rz+" class="jog">Rz+</button>
+          </div>
+        </div>
+      </div>
+      <p class="muted">勾选「平滑移动」后,按住方向按钮持续移动,松开即停(步距越小越平滑);未勾选时单击一次移动一个步距。</p>
+
+      <div class="card">
+        <h3>目标点位姿移动 (需 IK)</h3>
+        <div class="row">
+          <label>X (mm) <input id="tgtX" type="number" step="0.1" /></label>
+          <label>Y (mm) <input id="tgtY" type="number" step="0.1" /></label>
+          <label>Z (mm) <input id="tgtZ" type="number" step="0.1" /></label>
+          <label>Roll <input id="tgtR" type="number" step="1" value="0" /></label>
+          <label>Pitch <input id="tgtP" type="number" step="1" value="0" /></label>
+          <label>Yaw <input id="tgtYaw" type="number" step="1" value="0" /></label>
+          <button id="cartGoto" class="primary">执行</button>
+          <button id="cartFillCurrent">填入当前</button>
+        </div>
+        <p class="muted">当前位姿会作为基座偏移补偿,IK 在系统 Python 子进程中求解。</p>
+      </div>
+
+      <div class="card">
+        <h3>夹爪 / 末端执行器</h3>
+        <div class="row">
+          <label>张开 <input id="gripOpen" type="number" value="1000" size="5" /></label>
+          <label>闭合 <input id="gripClose" type="number" value="0" size="5" /></label>
+          <label>速度 <input id="gripSpeed" type="number" value="500" size="5" /></label>
+          <button data-grip="open" class="primary">张开</button>
+          <button data-grip="close">闭合</button>
+        </div>
+        <div id="gripInfo" class="muted"></div>
+      </div>
+    </section>
+
+    <!-- ============== 关节示教 ============== -->
+    <section id="tab-joint-teach" class="panel">
+      <div class="card">
+        <h3>工程设置</h3>
+        <div class="row">
+          <label>机械臂
+            <select id="jtArm"><option value="armleft">左臂</option><option value="armright">右臂</option></select>
+          </label>
+          <label>工程名
+            <input id="jtName" type="text" placeholder="my_joint_path" size="20" />
+          </label>
+          <button id="jtRecord" class="primary">● 记录当前</button>
+          <button id="jtClear">清空</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>路点列表</h3>
+        <table class="pttab">
+          <thead><tr><th>#</th><th>关节角 (°)</th><th>夹爪</th><th>备注</th><th></th></tr></thead>
+          <tbody id="jtBody"><tr><td colspan="5" class="muted">暂无路点</td></tr></tbody>
+        </table>
+        <div class="row">
+          <button id="jtUp">↑ 上移</button>
+          <button id="jtDown">↓ 下移</button>
+          <button id="jtDel">删除</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>保存 / 加载 / 回放</h3>
+        <div class="row">
+          <button id="jtSave" class="primary">💾 保存工程</button>
+          <select id="jtLoadSel"><option value="">(加载已有工程)</option></select>
+          <button id="jtLoad">加载</button>
+          <button id="jtDelFile">删除工程</button>
+          <button id="jtRefresh" class="primary">↻</button>
+          <button id="jtPlay" class="primary">▶ 回放</button>
+        </div>
+        <div id="jtStatus" class="muted"></div>
+      </div>
+    </section>
+
+    <!-- ============== 笛卡尔示教 ============== -->
+    <section id="tab-cart-teach" class="panel">
+      <div class="card">
+        <h3>工程设置</h3>
+        <div class="row">
+          <label>机械臂
+            <select id="ctArm"><option value="armleft">左臂</option><option value="armright">右臂</option></select>
+          </label>
+          <label>工程名
+            <input id="ctName" type="text" placeholder="my_cart_path" size="20" />
+          </label>
+          <button id="ctRecord" class="primary">● 记录当前末端位姿</button>
+          <button id="ctClear">清空</button>
+        </div>
+        <pre id="ctCurrentPose" class="posebox">-</pre>
+      </div>
+      <div class="card">
+        <h3>路点列表</h3>
+        <table class="pttab">
+          <thead><tr><th>#</th><th>位置 (m)</th><th>四元数</th><th>夹爪</th><th>备注</th><th></th></tr></thead>
+          <tbody id="ctBody"><tr><td colspan="6" class="muted">暂无路点</td></tr></tbody>
+        </table>
+        <div class="row">
+          <button id="ctUp">↑ 上移</button>
+          <button id="ctDown">↓ 下移</button>
+          <button id="ctDel">删除</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>保存 / 加载 / 回放</h3>
+        <div class="row">
+          <button id="ctSave" class="primary">💾 保存工程</button>
+          <select id="ctLoadSel"><option value="">(加载已有工程)</option></select>
+          <button id="ctLoad">加载</button>
+          <button id="ctDelFile">删除工程</button>
+          <button id="ctRefresh" class="primary">↻</button>
+          <button id="ctPlay" class="primary">▶ 回放 (IK)</button>
+        </div>
+        <div id="ctStatus" class="muted"></div>
+      </div>
+    </section>
+
+    <!-- ============== 点位复现 ============== -->
+    <section id="tab-pose-lib" class="panel">
+      <div class="card">
+        <h3>当前点位 → 保存为命名点位</h3>
+        <div class="row">
+          <label>机械臂
+            <select id="plArm"><option value="armleft">左臂</option><option value="armright">右臂</option></select>
+          </label>
+          <label>点位名
+            <input id="plName" type="text" placeholder="home_pick" size="20" />
+          </label>
+          <button id="plSave" class="primary">💾 保存当前</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>已有点位</h3>
+        <div class="row">
+          <button id="plRefresh" class="primary">↻ 刷新</button>
+        </div>
+        <ul id="plList" class="pl-list"><li class="muted">未加载</li></ul>
+      </div>
+    </section>
+
+    <!-- ============== 物料检测 ============== -->
+    <section id="tab-pose-detect" class="panel">
+      <div class="card">
+        <h3>检测服务</h3>
+        <div class="row">
+          <span id="pdSvcStatus" class="badge off">未启动</span>
+          <button id="pdSvcStart" class="primary">启动服务</button>
+          <button id="pdSvcStop">停止服务</button>
+        </div>
+        <p class="muted">服务位于 yolo11_env 解释器(独立 GPU 进程);首次启动 ~10s。</p>
+      </div>
+      <div class="card">
+        <h3>检测</h3>
+        <div class="row">
+          <label>相机
+            <select id="pdCam">
+              <option value="left">左腕</option>
+              <option value="head">头部</option>
+              <option value="right">右腕</option>
+            </select>
+          </label>
+          <label>置信度
+            <input id="pdConf" type="number" min="0.05" max="0.9" step="0.05" value="0.25" size="4" />
+          </label>
+          <button id="pdDetect" class="primary">🔍 检测一帧</button>
+          <label><input type="checkbox" id="pdLoop" /> 连续检测</label>
+          <label>间隔(s) <input id="pdInterval" type="number" min="0.5" max="10" step="0.5" value="1.5" size="3" /></label>
+        </div>
+        <div class="pd-result">
+          <img id="pdImg" alt="detect" />
+          <div>
+            <h4>检测结果</h4>
+            <pre id="pdJson" class="posebox">-</pre>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== 一步到位(吸取) ===== -->
+      <div class="card">
+        <h3>🎯 一步到位设置</h3>
+        <div class="row">
+          <span id="pkScanBadge" class="badge off">扫描位:未示教</span>
+          <span id="pkAlignBadge" class="badge off">对准:未校正</span>
+          <span id="pkDepthBadge" class="badge off">深度:未启动</span>
+          <span id="pkHandeyeBadge" class="badge off">手眼:?</span>
+        </div>
+        <div class="row">
+          <label>相机
+            <select id="pkRole">
+              <option value="left">左腕(标定绑定)</option>
+              <option value="head">头部</option>
+              <option value="right">右腕</option>
+            </select>
+          </label>
+          <label>置信度 <input id="pkConf" type="number" min="0.05" max="0.9" step="0.05" value="0.5" size="4" /></label>
+          <label>路径
+            <select id="pkMotion">
+              <option value="direct">一段直达</option>
+              <option value="corridor">分段走廊</option>
+            </select>
+          </label>
+          <label>下压mm <input id="pkPress" type="number" min="0" max="10" step="1" value="0" size="3" /></label>
+          <label>保持s <input id="pkHold" type="number" min="0" max="30" step="0.5" value="2" size="3" /></label>
+          <label>真空
+            <select id="pkVacuum">
+              <option value="manual">手动(外部)</option>
+              <option value="gripper">联动夹爪</option>
+            </select>
+          </label>
+          <button id="pkSaveCfg">💾 保存设置</button>
+        </div>
+        <p class="muted">手眼标定 2026-10-20 绑定左腕相机;标签轮换后无帧/定位错请换相机并重扫。
+          吸取全程速度取顶栏全局速度(左臂);首跑建议把左臂全局速度调 8、下压 0,到位悬停人工确认后再校正/加压。</p>
+      </div>
+
+      <div class="card">
+        <h3>扫描与吸取</h3>
+        <div class="row">
+          <button id="pkTeachScan" class="primary">📌 存当前为扫描位</button>
+          <button id="pkScan" class="primary">🔍 扫描(回放扫描位)</button>
+          <label><input type="checkbox" id="pkScanNoReplay" /> 不回放(就在当前视角扫)</label>
+        </div>
+        <div id="pkScanInfo" class="muted" style="margin-bottom:6px;">先手动把臂移到货架全景视角,存扫描位;之后扫描会自动回到该视角。</div>
+        <table class="pttab" id="pkBagTable" style="display:none;">
+          <thead><tr><th>#</th><th>层</th><th>正/反</th><th>conf</th><th>z(mm)</th><th>袋心基座(x,y,z mm)</th><th>动作</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h3>吸取任务</h3>
+        <div class="row">
+          <span id="pkPhase" class="badge off">空闲</span>
+          <button id="pkStop" class="danger">⏹ 停止(段间)</button>
+        </div>
+        <div class="pk-progress"><div id="pkBar"></div></div>
+        <pre id="pkLog" class="posebox">-</pre>
+        <p class="muted">干跑只规划不动臂;实吸前请先干跑看走廊计划。中途硬停用顶部 ⛔(断电级)。</p>
+      </div>
+
+      <div class="card">
+        <h3>对准校正</h3>
+        <div class="row">
+          <label>袋号# <input id="pkAlignBag" type="number" min="1" step="1" value="1" size="3" /></label>
+          <label><input type="checkbox" id="pkAlignPerBag" /> 仅修此袋(分袋残差)</label>
+          <button id="pkTeachAlign" class="primary">📌 校正吸取位</button>
+        </div>
+        <p class="muted">吸嘴悬停在袋上方没对准时: 用『笛卡尔移动』微调到正确吸附点(轻触),
+          然后点校正 —— 残差 = 实测位姿 − 预测袋心,自动存全局(或分袋)。</p>
+      </div>
+
+      <!-- 隐藏残差微调:三连击上方「对准」徽章呼出,无显式入口(防随意修改) -->
+      <div id="pkResidPanel" class="card"
+           style="display:none; position:fixed; right:16px; bottom:16px; z-index:60; margin:0; max-width:380px">
+        <h3 style="margin:2px 0 4px">残差微调
+          <button id="pkResidClose" style="float:right; padding:0 8px">✕</button></h3>
+        <p class="muted" style="margin:2px 0 6px">基座系 mm,点按钮立即写入配置。
+          y≈吸嘴长度(≈92,大改会吸空);z 负=落点更低。</p>
+        <div class="row" data-ax="x" style="gap:4px; margin:4px 0">
+          <label style="min-width:88px">X <b class="pk-rv">0.00</b> mm</label>
+          <button class="pk-rb" data-d="-1">−1</button>
+          <button class="pk-rb" data-d="-0.1">−0.1</button>
+          <button class="pk-rb" data-d="0.1">+0.1</button>
+          <button class="pk-rb" data-d="1">+1</button>
+        </div>
+        <div class="row" data-ax="y" style="gap:4px; margin:4px 0">
+          <label style="min-width:88px">Y <b class="pk-rv">0.00</b> mm</label>
+          <button class="pk-rb" data-d="-1">−1</button>
+          <button class="pk-rb" data-d="-0.1">−0.1</button>
+          <button class="pk-rb" data-d="0.1">+0.1</button>
+          <button class="pk-rb" data-d="1">+1</button>
+        </div>
+        <div class="row" data-ax="z" style="gap:4px; margin:4px 0">
+          <label style="min-width:88px">Z <b class="pk-rv">0.00</b> mm</label>
+          <button class="pk-rb" data-d="-1">−1</button>
+          <button class="pk-rb" data-d="-0.1">−0.1</button>
+          <button class="pk-rb" data-d="0.1">+0.1</button>
+          <button class="pk-rb" data-d="1">+1</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============== 双臂流水线 ============== -->
+    <section id="tab-flow" class="panel">
+      <div class="card">
+        <h3>使用步骤(第一次跑通按这个顺序)</h3>
+        <ol class="muted" style="margin:6px 0 2px 18px;line-height:1.9;">
+          <li><b>右臂手眼标定</b>(一次性,方法见下卡;左臂已有)。</li>
+          <li><b>贴码</b>:中间件贴左臂能看到的码、右臂能看到的码,料仓贴一张。
+            类型可选 <b>ArUco</b>(ID 默认 0/1/2)或 <b>QR 二维码</b>(黑白/红金均可,
+            "QR 内容"留空=认画面里第一张,填内容=只认那张);用卡尺量码边,
+            填进"码边mm"后点💾存码参数。</li>
+          <li><b>示教动作</b>:用"笛卡尔移动/关节示教"页手动把臂摆到目标位,回到本页对应动作行点
+            <b>📌加路点</b>。每个动作 = 一串路点,末点要求见各行动作标题
+            (A1/B1/B3 的末点=对准观察位,即码在相机画面中央的悬停位)。
+            动作行下拉可设<b>真空触发</b>(吸取/释放 @第几点/终点)。</li>
+          <li><b>记录 PBVS 参考</b>:手动把臂移到 A1 末点 → 点"记录参考";右臂再分别到
+            B1 末点、B3 末点各记录一次。参考只记一次,之后改路点不用重记
+            (只有挪码/换码才要重记)。</li>
+          <li><b>单动作试跑</b>:每个动作行 ▶试跑;到位后点"测试 PBVS 对准"看 Δ 与 PASS;想真修一下验证 PBVS 准不准 → 『⚡ 回观察位并修正』(回观察位→实际修正→复测,修完停在那看效果)。</li>
+          <li><b>联调</b>:勾"单步确认模式" → ▶启动,每步看一眼点"确认本步";
+            也可先 ▶左臂测试 / ▶右臂测试(各只跑 1 个循环自动停,不等另一臂,
+            前置检查也只查该臂 —— 左臂跑 料筐→中间件,右臂跑 中间件→料仓)。</li>
+          <li><b>正式运行</b>:取消单步 → ▶启动。<b>PBVS 对准全自动</b>插在
+            A1 之后、B1 之后、B3 之后执行,不用手动点。</li>
+        </ol>
+      </div>
+
+      <div class="card">
+        <h3>就绪检查 / 手眼标定</h3>
+        <div class="row">
+          <span id="flHeLeft" class="badge off">左臂手眼:?</span>
+          <span id="flHeRight" class="badge off">右臂手眼:?</span>
+          <span id="flPickPose" class="badge off">左臂扫描位:?</span>
+          <button id="flRefresh" class="primary">↻ 刷新</button>
+        </div>
+        <ul id="flReady" class="muted" style="margin:6px 0 2px;"></ul>
+        <p class="muted">路点「中点」标记:动作路点列表里每点可点
+          <span class="badge on" style="cursor:pointer;">●中点</span> 切换。
+          标记后中心互斥细化到<b>路点级</b> —— 回放<b>走向中点前抢锁</b>,
+          <b>走到其后第一个非标记点(退出段走完)才交锁</b>,闸门与跨动作自然衔接;
+          都不标 = 整段互斥(A1→A2 / B1→B2 一把锁)。建议: A1/B1 末点(观察位)
+          与 A2/B2 的下降取放点标中点,A2/B2 末段示教一个<b>非中点</b>退出路点。</p>
+        <p class="muted">路点「⏱等待」: 每点可点
+          <span class="badge on" style="cursor:pointer;">⏱1s</span> 输入秒数,
+          回放<b>走到该点(到位验证之后)停留 N 秒</b>再走剩余段 —— 吸/放前
+          稳一稳、等真空建立、等抖动衰减用;同一点既是真空触发点又有等待时,
+          顺序 = 到点 → 等待 → 触发真空。改 0 取消。</p>
+        <p class="muted">右臂手眼标定:把 <code>pbvs/tianlian_pbvs/tools/one_click_handeye.py</code>
+          复制为 right 版(arm=armright、相机 right、标定板同左臂),标完把含
+          <code>T_ee_camera</code> 的 yaml 存为 <code>flow_data/handeye_armright.yaml</code>
+          (键名与左臂 pick_data 的 yaml 相同)。为什么要标见本页底部说明。</p>
+      </div>
+
+      <div class="card">
+        <h3>🤏 动作间夹爪整形(可选,想插哪就插哪)</h3>
+        <div id="flGripList"></div>
+        <p class="muted" style="margin:6px 0 0;">开口 0=闭合、1000=张开。每个插槽独立开关:
+          该步完成后把夹爪调到开口目标并等"等待s"再走下一步(不动臂)。
+          夹爪指令失败会停线。改完点该行 💾 保存。</p>
+      </div>
+
+      <div class="card">
+        <h3>PBVS 对准(自动插在动作之间)与参数</h3>
+        <div class="row">
+          <label>模式
+            <select id="flGateMode">
+              <option value="verify">T1 每轮测一次(默认,~0.3s)</option>
+              <option value="off">T0 纯回放(极限节拍,盲放)</option>
+            </select>
+          </label>
+          <label>XY容差mm <input id="flTolXY" type="number" min="0.5" max="20" step="0.5" value="2" size="3" /></label>
+          <label>Z容差mm <input id="flTolZ" type="number" min="0.5" max="20" step="0.5" value="3" size="3" /></label>
+          <label>修正上限mm <input id="flMaxCorr" type="number" min="5" max="100" step="5" value="40" size="3" /></label>
+          <label>修正步数 <input id="flIter" type="number" min="1" max="4" step="1" value="2" size="2" /></label>
+          <label>测帧中值 <input id="flFrames" type="number" min="1" max="5" step="1" value="3" size="2" /></label>
+          <button id="flSaveCfg" class="primary">💾 保存</button>
+        </div>
+        <p class="muted">T1: 到对准观察位测一次码位置,Δ=实测−参考 ≤ 容差直接过,超差在基座系
+          一步修正后复测(最多"修正步数"次);Δ 超修正上限=疑似工装被撞,停线报警。
+          T0: 不测量纯回放,只靠臂重复精度。对准是<b>对准之后再播后续示教动作</b>:
+          A1 到观察位 → PBVS 对准 → 才播 A2 下降放料(右臂 B1→对准→B2、B3→对准→B4 同理)。
+          左右臂共用本组参数。<b>每站可单独停用</b>:勾掉『启用 PBVS 对准』,该站按示教关节回放
+          (效果同 T0 但只影响这一站),就绪检查会提示;⚡单步验证也会要求先启用。</p>
+      </div>
+
+      <div class="card">
+        <h3>🦾 左臂:视觉吸料 → 放中间件</h3>
+        <p class="muted">
+          吸料部分<b>全由视觉自动执行</b>(与『物料检测』页一步到位同款:参数、吸真空方式
+          沿用其设置;扫描位也在该页示教)。每轮循环执行顺序:<br>
+          <b>① 物料检测(自动:回扫描位 → YOLO+深度 → 基座系定位选袋)
+          → ② 移动到物料上方(自动:升越顶 → 转对准姿态 → 水平平移)
+          → ③ 下降+下压(自动:降到袋面,沿吸嘴轴向压入)
+          → ④ 吸取(手动:保持窗口内接真空)
+          → ⑤ 垂直抬升(自动) → A1(示教) → PBVS对准(自动) → A2(示教)</b>。<br>
+          你只需示教 A1 / A2(加上『物料检测』页的扫描位)。
+        </p>
+        <div id="flActsLeft"></div>
+        <h4 style="margin-top:10px;">中间件 PBVS 参考(左臂视角的码)</h4>
+        <div class="row">
+          <label title="停用=该站跳过 PBVS 对准:按示教关节回放,不测码不修正(只影响这一站;改完对下次启动生效,运行中的流水线不变)"><input type="checkbox" id="flEnL" checked /> 启用 PBVS 对准</label>
+          <label>码类型
+            <select id="flLMkType">
+              <option value="aruco">ArUco</option>
+              <option value="qr">QR 二维码</option>
+            </select>
+          </label>
+          <label>ArUco ID <input id="flLMkId" type="number" min="0" max="49" step="1" value="0" size="3" /></label>
+          <label>QR 内容 <input id="flLMkData" type="text" size="8" placeholder="留空=任意" /></label>
+          <label>码边mm <input id="flLMkSize" type="number" min="20" max="500" step="1" value="100" size="4" /></label>
+          <button id="flSaveMkL" >💾 存码参数</button>
+          <button id="flRefL" class="primary">📌 记录 PBVS 参考(当前位)</button>
+          <button id="flTestL">🔍 测试 PBVS 对准(不动臂)</button>
+          <button id="flGotoL">🧲 回观察位并测(动臂)</button>
+          <button id="flFixL">⚡ 回观察位并修正(动臂·单步验 PBVS)</button>
+        </div>
+        <div id="flRefInfoL" class="muted">未记录。把左臂移到 A1 末点(观察位,码在画面中央)再记录。</div>
+        <img id="flRefSnapL" style="max-width:340px;display:none;margin-top:4px;border:1px solid #ccc;" />
+      </div>
+
+      <div class="card">
+        <h3>🦿 右臂:取中间件 → 放料仓</h3>
+        <p class="muted">执行顺序:<b>B0(可选) → B1 → PBVS对准·中间件(自动) → B2 →
+          B3 → PBVS对准·料仓(自动) → B4</b>。对准之后再播 B2/B4 下降动作。</p>
+        <div id="flActsRight"></div>
+        <p class="muted" style="margin:6px 0 0;">动作之间想插夹爪操作(开合到目标值再等一会)→ 用下方
+          「🤏 动作间夹爪整形」卡片,任意位置可插。</p>
+        <div class="row" style="margin-top:8px;">
+          <span class="muted">PBVS 参考两处:</span>
+          <button id="flRefR1" class="primary">📌 记录中间件参考(当前位)</button>
+          <button id="flTestR1">🔍 测试</button>
+          <button id="flGotoR1">🧲 回观察位并测</button>
+          <button id="flFixR1">⚡ 回观察位并修正</button>
+          <button id="flRefR2" class="primary">📌 记录料仓参考(当前位)</button>
+          <button id="flTestR2">🔍 测试</button>
+          <button id="flGotoR2">🧲 回观察位并测</button>
+          <button id="flFixR2">⚡ 回观察位并修正</button>
+        </div>
+        <pre id="flFixOut" class="muted" style="margin:6px 0 0;white-space:pre-wrap;font-size:12px;max-height:180px;overflow-y:auto;border:1px dashed #456;border-radius:4px;padding:4px 8px;">⚡『回观察位并修正』的单步验证输出显示在这里(三处按钮共用,与流水线闸门同一条代码路径;修完停在修正后的位置,Δ 锚不传导)。</pre>
+        <div class="row">
+          <label title="停用=右臂中间件站跳过 PBVS 对准:按示教关节回放,不测码不修正(只影响这一站;改完对下次启动生效)"><input type="checkbox" id="flEnR1" checked /> 启用·中间件</label>
+          <span>中间件码:</span>
+          <label>类型
+            <select id="flRMk1Type">
+              <option value="aruco">ArUco</option>
+              <option value="qr">QR 二维码</option>
+            </select>
+          </label>
+          <label>ArUco ID <input id="flRMk1Id" type="number" min="0" max="49" step="1" value="1" size="3" /></label>
+          <label>QR 内容 <input id="flRMk1Data" type="text" size="8" placeholder="留空=任意" /></label>
+          <label>码边mm <input id="flRMk1Size" type="number" min="20" max="500" step="1" value="100" size="4" /></label>
+          <label title="停用=料仓站跳过 PBVS 对准:按示教关节回放,不测码不修正(只影响这一站;改完对下次启动生效)"><input type="checkbox" id="flEnR2" checked /> 启用·料仓</label>
+          <span>料仓码:</span>
+          <label>类型
+            <select id="flRMk2Type">
+              <option value="aruco">ArUco</option>
+              <option value="qr">QR 二维码</option>
+            </select>
+          </label>
+          <label>ArUco ID <input id="flRMk2Id" type="number" min="0" max="49" step="1" value="2" size="3" /></label>
+          <label>QR 内容 <input id="flRMk2Data" type="text" size="8" placeholder="留空=任意" /></label>
+          <label>码边mm <input id="flRMk2Size" type="number" min="20" max="500" step="1" value="100" size="4" /></label>
+          <button id="flSaveMkR">💾 存码参数</button>
+        </div>
+        <div id="flRefInfoR" class="muted">中间件参考:未记录 | 料仓参考:未记录。分别在 B1 末点、B3 末点记录。</div>
+        <img id="flRefSnapR" style="max-width:340px;display:none;margin-top:4px;border:1px solid #ccc;" />
+      </div>
+
+      <div class="card">
+        <h3>运行</h3>
+        <div class="row">
+          <span id="flFixture" class="badge off">中间件:?</span>
+          <label title="留空/0=连续不停;N=每臂跑满 N 个循环后整线自动停(右臂会把第 N 件送完料仓才停)">轮次
+            <input id="flRounds" type="number" min="0" max="999" step="1" placeholder="连续" size="3" /></label>
+          <label><input type="checkbox" id="flStepMode" /> 单步确认模式(每个动作前暂停等确认)</label>
+          <button id="flStart" class="primary">▶ 启动流水线</button>
+          <button id="flStartL" title="只跑左臂: 扫描吸取 → 放中间件,1 个循环自动停,不等右臂">▶ 左臂测试</button>
+          <button id="flStartR" title="只跑右臂: 取中间件 → 放料仓,1 个循环自动停,不等左臂(需中间件有料)">▶ 右臂测试</button>
+          <button id="flStop" class="danger">⏹ 停止(段间)</button>
+          <button id="flStepOk">⏭ 确认本步</button>
+        </div>
+        <div class="fl-two">
+          <div>
+            <h4>左臂 <span id="flPhaseL" class="badge off">空闲</span>
+              <span class="muted" id="flStatL"></span></h4>
+            <pre id="flLogL" class="posebox">-</pre>
+          </div>
+          <div>
+            <h4>右臂 <span id="flPhaseR" class="badge off">空闲</span>
+              <span class="muted" id="flStatR"></span></h4>
+            <pre id="flLogR" class="posebox">-</pre>
+          </div>
+        </div>
+        <pre id="flLog" class="posebox" style="max-height:120px;">-</pre>
+        <div class="row" style="margin-top:6px;">
+          <b>📈 运行报告</b>
+          <label>开始日期
+            <input id="flRptStart" type="date" /></label>
+          <label>结束日期
+            <input id="flRptEnd" type="date" /></label>
+          <button id="flRptView">🔍 预览</button>
+          <button id="flRptExport" class="primary">⬇ 导出 CSV</button>
+        </div>
+        <div id="flRptBox" class="muted"
+             style="margin-top:6px;">按时间段汇总每轮 A/B 大步耗时(默认当天),预览后可导出同口径 CSV。</div>
+        <p class="muted">首次联调务必用单步确认模式 + 低速;急停用顶部 ⛔(断电级,流水线会自动停线)。</p>
+      </div>
+
+      <div class="card">
+        <h3>为什么右臂也要手眼标定?(不是有 PBVS 就不用吗)</h3>
+        <p class="muted" style="white-space:pre-wrap;">本页的对准闸门是"基于位置的视觉伺服(PBVS)"的提速形态:到观察位后测一次码位置,把 Δ=实测−参考 换算成基座系修正量,一步修过去 —— 省掉传统迭代伺服的反复逼近。
+把"相机系像素"变成"基座系该挪多少",必须经过 T_ee_camera(手眼矩阵);这正是手眼标定的产物。没有它,只有两条路: ① 迭代式 PBVS(每臂每个站位先做 6 次微动差分标定,对准要迭代多步,节拍吃亏); ② 纯示教回放(完全没有视觉兜底)。
+另外 PBVS 伺服本身也内含手眼: 迭代版的 J 雅可比就是手眼关系的局部差分标定 —— 所以准确说法是"PBVS 不需要全工作空间的手眼矩阵,但需要局部手眼标定"; 我们选 X 矩阵方案是因为一次标定全站位通用,且左臂的"YOLO 定位物料→基座系→一步吸取"同一套变换,右臂补一次标定后左右代码完全对称。</p>
+      </div>
+    </section>
+
+    <!-- ============== 相机 ============== -->
+    <section id="tab-camera" class="panel">
+      <div class="cam-controls">
+        <label><input type="checkbox" class="cam" value="left" checked /> 左腕</label>
+        <label><input type="checkbox" class="cam" value="head" /> 头部</label>
+        <label><input type="checkbox" class="cam" value="right" checked /> 右腕</label>
+        <span class="sep"></span>
+        <label>帧率 <input id="camFps" type="number" min="1" max="20" value="8" size="3" /></label>
+        <button id="btnCamApply" class="primary">应用</button>
+        <button id="btnCamSnap">抓拍</button>
+        <span class="muted" id="camInfo">未启动</span>
+      </div>
+      <div class="cam-grid">
+        <div class="cam-cell" data-cam="left"><h4>左腕</h4><img class="cam-img" /><div class="cam-meta"></div></div>
+        <div class="cam-cell" data-cam="right"><h4>右腕</h4><img class="cam-img" /><div class="cam-meta"></div></div>
+        <div class="cam-cell" data-cam="head"><h4>头部</h4><img class="cam-img" /><div class="cam-meta"></div></div>
+      </div>
+    </section>
+
+    <!-- ============== 底盘 ============== -->
+    <section id="tab-chassis" class="panel">
+      <div class="chassis-conn">
+        <label>底盘 IP <input id="chassisHost" value="192.168.1.20" size="14" /></label>
+        <label>端口 <input id="chassisPort" type="number" value="14444" size="6" /></label>
+        <button id="btnChConn" class="primary">连接</button>
+        <button id="btnChDisc">断开</button>
+        <button id="btnChCancel">⏹ 取消动作</button>
+        <button id="btnChRefreshMap" class="primary">刷新地图</button>
+        <span id="chStatus" class="badge off">未连接</span>
+      </div>
+      <div class="chassis-body">
+        <div class="map-wrap">
+          <h3>地图 (点击导航)</h3>
+          <div class="map-frame">
+            <img id="mapImg" alt="map" />
+          </div>
+          <div class="map-info">
+            <span>位姿:</span><span id="poseLine">-</span>
+            <span>激光:</span><span id="laserCount">0</span> 点
+          </div>
+        </div>
+        <div class="chassis-side">
+          <div class="card">
+            <h3>移动到</h3>
+            <label>X <input id="mvX" type="number" step="0.01" /></label>
+            <label>Y <input id="mvY" type="number" step="0.01" /></label>
+            <label>Yaw(rad) <input id="mvYaw" type="number" step="0.1" placeholder="留空=不转" /></label>
+            <button id="btnChMove" class="primary">导航</button>
+          </div>
+          <div class="card">
+            <h3>原地旋转</h3>
+            <label>角度(rad) <input id="rotAng" type="number" step="0.1" value="1.57" /></label>
+            <button id="btnChRot" class="primary">旋转</button>
+          </div>
+          <div class="card">
+            <h3>回桩</h3>
+            <label><input type="checkbox" id="dockCheck" checked /> 回桩后自动对接</label>
+            <button id="btnChHome" class="primary">回桩</button>
+          </div>
+          <div class="card">
+            <h3>遥控</h3>
+            <div class="joystick">
+              <button data-dir="0">↑</button>
+              <button data-dir="2">←</button>
+              <button data-dir="3">→</button>
+              <button data-dir="1">↓</button>
+            </div>
+            <label>时长(ms) <input id="jsDur" type="number" value="500" /></label>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
