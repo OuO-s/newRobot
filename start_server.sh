@@ -20,6 +20,9 @@ PY=/usr/bin/python3                 # conda base(3.14)没有 fastapi,必须系�
 set +u
 source /opt/ros/humble/setup.bash
 [ -f /home/user/fd_ws/install/setup.bash ] && source /home/user/fd_ws/install/setup.bash
+# 相机/hub ROS 栈固定域号:漏设的子进程(bridge/depth 会话)会落在 0 上
+export ROS_DOMAIN_ID=25
+export ROS_LOCALHOST_ONLY=0
 set -u
 
 HOST="${HOST:-0.0.0.0}"

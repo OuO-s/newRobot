@@ -115,6 +115,9 @@ def _ensure_cam_bridge() -> dict:
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)     # 清掉 webapp 环境残留,避免串版本
     env.pop("PYTHONHOME", None)
+    # hub 固定在 domain 25;漏设会落在 0 上永远收不到帧(2026-10-28 实证)
+    env.setdefault("ROS_DOMAIN_ID", "25")
+    env.setdefault("ROS_LOCALHOST_ONLY", "0")
     # rclpy 只在 ROS2 环境的系统 Python 3.10 里可用(GUI 同款拉起方式)
     cmd = (f"source /opt/ros/humble/setup.bash && "
            f"exec /usr/bin/python3 {script} --port {_CAM_BRIDGE_PORT}")

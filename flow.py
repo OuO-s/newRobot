@@ -475,15 +475,26 @@ class ArmLoop:
         done = False
         for attempt in range(2):
             self.check_abort()
+            send = traj
             if attempt:
-                self.say(f"{name}: 未到位,补走(第 {attempt} 次)")
+                self.say(f"{name}: 未到位,从当前位补走(第 {attempt} 次)")
                 cur = self.q_deg()
                 if len(cur) == len(target):
                     err = max(abs(a - b) for a, b in zip(cur, target))
                     if err <= tol:
                         done = True
                         break
-            self.robot.move_robotarm_traj(self.arm, traj, 1, timeout, speed)
+                    # 从当前位重发剩余段:前置当前关节、跳过已到达的前导点
+                    # —— 既兑现上面 docstring,也避免厂商服务器把"与上一
+                    # 目标完全相同的轨迹"当重复吞掉(2026-10-28 实测:低速
+                    # 大行程补走原样重发,60s 零进展直到到位超时)
+                    rest = [w[:] for w in traj]
+                    while rest and max(abs(a - b)
+                                       for a, b in zip(cur, rest[0])) <= tol:
+                        rest.pop(0)
+                    if rest:
+                        send = [cur] + rest
+            self.robot.move_robotarm_traj(self.arm, send, 1, timeout, speed)
             time.sleep(0.3)                          # 收敛中,稍等复读
             cur = self.q_deg()
             if len(cur) == len(target):
@@ -640,9 +651,13 @@ class ArmLoop:
         self.runner.runlog.event(
             "gate_start", self.arm, which=which, mode=gate["mode"],
             tol_xy_mm=gate["tol_xy_mm"], tol_z_mm=gate["tol_z_mm"],
-            ref_key=ref.get("key"))
+            ref_key=ref.get("key"), ref_created=ref.get("created"))
+        # 带录制时间:参考和当前工装/示教不配套时,一眼看出参考多旧
+        # (2026-10-28 右臂中间件参考录于 10-22,中间闸门一直关着没验证,
+        # 重新启用后测出 Δz12.9mm 把 B2 吸取点带偏 12.8mm)
         self.say(f"闸门[{where}]: 参考 Δ0 = "
-                 f"{np.round(ref['p_base'], 3).tolist()}m")
+                 f"{np.round(ref['p_base'], 3).tolist()}m"
+                 + (f"(录于 {ref['created']})" if ref.get("created") else ""))
         T_x = flow_store.load_handeye_T(self.arm)    # 缺文件抛 FileNotFoundError
         sess = self.runner.cameras.get(
             self.runner.cfg["arms"][self.arm]["cam_role"])
@@ -1541,7 +1556,12 @@ def goto_align_ref(robot: TianlianRobot, cameras: FlowCameras,
     tol = float(mv["joint_tol_deg"])
     target = [float(v) for v in joints]
     for attempt in range(2):
-        robot.move_robotarm_traj(arm, [target], 1, mv["move_timeout_s"], speed)
+        send = [target]
+        if attempt:          # 补走从当前位重发,避免相同目标被服务器当重复吞掉
+            cur0 = robot.get_joint_angles().get(arm) or []
+            if len(cur0) == len(target):
+                send = [cur0, target]
+        robot.move_robotarm_traj(arm, send, 1, mv["move_timeout_s"], speed)
         time.sleep(0.3)                       # 收敛中,稍等复读
         cur = robot.get_joint_angles().get(arm) or []
         if len(cur) == len(target) and \

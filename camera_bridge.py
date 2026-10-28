@@ -272,6 +272,11 @@ def main() -> None:
     OPTS["quality"] = args.jpeg_quality
     cams = [c.strip() for c in args.cams.split(",") if c.strip()]
 
+    # 域号兜底:fd_cameras_hub 固定跑在 25。webapp 自动拉起/看门狗重启链
+    # 曾都漏设 ROS_DOMAIN_ID → 落在默认 0 上永远看不见 hub,自愈循环空转
+    # (2026-10-28 实证:242 次重启全因 domain 0)。setdefault 不覆盖显式值。
+    os.environ.setdefault("ROS_DOMAIN_ID", "25")
+    os.environ.setdefault("ROS_LOCALHOST_ONLY", "0")
     rclpy.init()
     node = BridgeNode(cams)
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
