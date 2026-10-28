@@ -257,3 +257,27 @@ table.flrpt tr.flrpt-sub td { background: #141922; }
   position: absolute; left: 0; top: 0;
   pointer-events: none;
 }
+.poi-row { display: flex; gap: 4px; margin: 2px 0; align-items: center; }
+.poi-row > button:first-child { flex: 1; text-align: left; }
+#poiCsvPreview table, #poiCsvPreview th, #poiCsvPreview td { border: 1px solid #3a4150; border-collapse: collapse; padding: 1px 4px; font-size: 12px; }
+#poiCsvText { width: 100%; margin-top: 4px; }
+#mapImg { touch-action: none; }
+.map-tools { display: flex; gap: 6px; margin: 4px 0; }
+.map-tools button { padding: 2px 8px; font-size: 12px; }
+#patrolLive table, #patrolLive th, #patrolLive td { border: 1px solid #3a4150; border-collapse: collapse; padding: 1px 4px; font-size: 12px; }
+#patrolLogs div { font-size: 12px; margin: 2px 0; }
+#patrolLive table, #patrolLive th, #patrolLive td { border: 1px solid #3a4150; border-collapse: collapse; padding: 1px 4px; font-size: 12px; }
+#patrolLive { margin: 4px 0; }
+#patrolLogs a { color: #6fc3ff; }
+#patrolLive table, #patrolLive th, #patrolLive td { border: 1px solid #3a4150; border-collapse: collapse; padding: 1px 4px; font-size: 12px; }
+#patrolLogs a { color: #9fc1e8; }
+.btn-link { color: #9fc1e8; text-decoration: none; border: 1px solid #2a313a; padding: 2px 8px; border-radius: 3px; font-size: 12px; }
+/* 轨道编辑器弹层 */
+#trackEditModal { position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+  z-index: 300; display: flex; align-items: center; justify-content: center; }
+#trackEditModal .tem-panel { background: #14181f; border: 1px solid #3a4150;
+  border-radius: 8px; padding: 10px; max-width: 92vw; }
+.tem-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 8px; }
+.tem-map { position: relative; }
+.tem-map img { display: block; max-width: 86vw; max-height: 72vh; user-select: none; }
+#teCanvas { position: absolute; left: 0; top: 0; cursor: crosshair; }

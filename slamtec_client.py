@@ -6,7 +6,12 @@ Slamware 底盘内置 HTTP 服务(默认端口 14444),提供位姿、运动行�
 """
 from __future__ import annotations
 
+import base64
+import json
+import socket
 import struct
+import time
+import uuid
 
 import requests
 
@@ -26,6 +31,7 @@ class SlamtecChassis:
     """Slamware REST 客户端。"""
 
     def __init__(self, host: str, port: int = 14444, timeout: float = 3.0):
+        self._host = host
         self.base = f"http://{host}:{port}"
         self.timeout = timeout
         self.session = requests.Session()
@@ -57,8 +63,18 @@ class SlamtecChassis:
 
     # ------------------------------------------------------------------ 运动
     def move_to(self, x: float, y: float, yaw: float | None = None,
-                precise: bool = True, mode: int = 0) -> int:
-        """自主导航到目标点,返回 action_id。yaw 单位弧度。"""
+                precise: bool = True, mode: int = 0,
+                ignore_dynamic: bool = False,
+                speed_ratio: float | None = None) -> int:
+        """自主导航到目标点,返回 action_id。yaw 单位弧度。
+
+        mode 0 自由规划 / 1 严格沿轨(遇障停等) / 2 轨道优先(遇障绕行)。
+        ignore_dynamic=True 时追加官方 flag avoid_path_ignoring_dynamic_obstacles
+        (思岚飞书 FAQ「直线行驶·方式2」原文;对应 C++ SDK 5.1.1 枚举
+        MoveOptionFlagFindPathIgnoringDynamicObstacles 0x400=搜路失败时忽略
+        激光动态障碍二次搜索。若固件对该字符串报 400,换
+        find_path_ignoring_dynamic_obstacles 再试)。
+        """
         move_options: dict = {"mode": mode}
         if precise:
             move_options["flags"] = ["precise"]
@@ -67,6 +83,13 @@ class SlamtecChassis:
             if "with_yaw" not in flags:
                 flags.append("with_yaw")
             move_options["yaw"] = yaw
+        if ignore_dynamic:
+            flags = move_options.setdefault("flags", [])
+            if "avoid_path_ignoring_dynamic_obstacles" not in flags:
+                flags.append("avoid_path_ignoring_dynamic_obstacles")
+        # 速度比例(官方 move_options.speed_ratio,插件>=4.5.4):本次导航最大速=全局上限×比例
+        if speed_ratio is not None:
+            move_options["speed_ratio"] = max(0.1, min(1.0, float(speed_ratio)))
         payload = self._request("POST", "/api/core/motion/v1/actions", {
             "action_name": ACTION_MOVE_TO,
             "options": {"target": {"x": x, "y": y, "z": 0.0},
@@ -88,6 +111,91 @@ class SlamtecChassis:
         payload = self._request("POST", "/api/core/motion/v1/actions", {
             "action_name": ACTION_MOVE_BY, "options": options}).json()
         return int(payload.get("action_id", -1))
+
+    # ------------------------------------------------------- 虚拟轨道(1445 通道)
+    def get_track_segments(self) -> list[dict]:
+        """读底盘虚拟轨道(RoboStudio 画的,存于底盘)。
+
+        REST 1448 没有对应接口,走底盘原生 1445 JSON 通道:
+        先 getrobotconfig 握手,再 getlines{usage:"virtual_track"}。
+        lines 字段是 base64 的自定义二进制:9 字节头 + N×20 字节记录
+        {f32 x1, y1, x2, y2; u32 id}(实测 Hermes 5.2.1)。
+        返回 [{id, x1, y1, x2, y2}];无轨道返回空表,失败抛 SlamtecError。
+        """
+        try:
+            sock = socket.create_connection((self._host, 1445), timeout=4)
+        except OSError as e:
+            raise SlamtecError(f"连 1445 失败: {e.__class__.__name__}") from e
+        sock.settimeout(5)
+        try:
+            return self._track_via_1445(sock)
+        finally:
+            sock.close()
+
+    def _track_via_1445(self, sock: socket.socket) -> list[dict]:
+        rid = 0
+        buf = b""
+
+        def read_json() -> dict | None:
+            nonlocal buf
+            while True:
+                for i in range(len(buf)):
+                    if buf[i:i + 1] != b"{":
+                        continue
+                    depth, instr, esc = 0, False, False
+                    for j in range(i, len(buf)):
+                        c = buf[j:j + 1]
+                        if esc:
+                            esc = False
+                        elif c == b"\\":
+                            esc = True
+                        elif c == b'"':
+                            instr = not instr
+                        elif not instr:
+                            if c == b"{":
+                                depth += 1
+                            elif c == b"}":
+                                depth -= 1
+                                if depth == 0:
+                                    obj, buf = buf[i:j + 1], buf[j + 1:]
+                                    return json.loads(obj.decode("utf-8", "replace"))
+                    break
+                data = sock.recv(65536)
+                if not data:
+                    return None
+                buf += data
+
+        def send(cmd: str, args=None) -> dict | None:
+            nonlocal rid
+            rid += 1
+            sock.sendall((json.dumps({"args": args, "command": cmd,
+                                      "request_id": rid}) + "\r\n\r\n").encode())
+            t0 = time.time()
+            while time.time() - t0 < 6:
+                r = read_json()
+                if r is not None and r.get("request_id") == rid:
+                    return r
+            return None
+
+        send("getrobotconfig")                       # 握手(内容不用)
+        r = send("getlines", {"usage": "virtual_track"})
+        if r is None or "result" not in r:
+            raise SlamtecError("getlines 无响应")
+        blob = (r["result"] or {}).get("lines") or ""
+        if not blob:
+            return []
+        try:
+            raw = base64.b64decode(blob)
+        except (ValueError, TypeError) as e:
+            raise SlamtecError(f"lines 编码异常: {e}") from e
+        n = (len(raw) - 9) // 20
+        if n < 0 or (len(raw) - 9) % 20:
+            raise SlamtecError(f"lines 长度异常: {len(raw)}")
+        segs = []
+        for i in range(n):
+            x1, y1, x2, y2, lid = struct.unpack_from("<ffffI", raw, 9 + i * 20)
+            segs.append({"id": lid, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+        return segs
 
     def rotate_to(self, angle_rad: float) -> int:
         payload = self._request("POST", "/api/core/motion/v1/actions", {
@@ -149,6 +257,28 @@ class SlamtecChassis:
         """RoboStudio 存的点位(兴趣点):[{id, metadata:{display_name}, pose}]。"""
         return self._request("GET", "/api/core/artifact/v1/pois").json()
 
+    def get_poi(self, poi_id: str) -> dict:
+        """单个点位详情。"""
+        return self._request("GET", f"/api/core/artifact/v1/pois/{poi_id}").json()
+
+    def add_poi(self, name: str, x: float, y: float, yaw: float | None = None,
+                poi_id: str | None = None) -> str:
+        """新建点位。厂商示例不带 pose,这里带上;固件若忽略会落在 (0,0),
+        调用方须读回校验(get_poi)。"""
+        if not poi_id:
+            poi_id = "web-" + uuid.uuid4().hex[:12]
+        self._request("POST", "/api/core/artifact/v1/pois", {
+            "id": poi_id,
+            "metadata": {"cargo_id": "", "display_name": name,
+                         "station_id": "", "type": "TAG"},
+            "pose": {"x": float(x), "y": float(y), "z": 0.0,
+                     "yaw": float(yaw or 0.0), "pitch": 0.0, "roll": 0.0},
+        })
+        return poi_id
+
+    def delete_poi(self, poi_id: str) -> None:
+        self._request("DELETE", f"/api/core/artifact/v1/pois/{poi_id}")
+
     def get_homedocks(self) -> list:
         """充电桩位列表,结构同 POI。"""
         return self._request("GET", "/api/core/slam/v1/homedocks").json()
@@ -164,6 +294,17 @@ class SlamtecChassis:
     def get_speed(self) -> dict:
         """当前速度: {vx, vy, omega}。"""
         return self._request("GET", "/api/core/motion/v1/speed").json()
+
+    def get_system_parameter(self, param: str) -> str:
+        """读设备系统参数(如 base.max_moving_speed,单位 m/s)。"""
+        from urllib.parse import quote
+        return self._request("GET", "/api/core/system/v1/parameter?param="
+                             + quote(param)).json()
+
+    def set_system_parameter(self, param: str, value) -> None:
+        """写设备系统参数(即时生效;厂商示例:base.max_moving_speed=速度m/s)。"""
+        self._request("PUT", "/api/core/system/v1/parameter",
+                      {"param": param, "value": value})
 
     def get_current_action(self) -> dict | None:
         """当前运动行为;空闲(404)返回 None。"""

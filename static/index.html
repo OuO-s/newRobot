@@ -716,6 +716,10 @@
       <div class="chassis-body">
         <div class="map-wrap">
           <h3>地图 (点击导航)</h3>
+          <div class="map-tools">
+            <button id="btnChTrail" class="primary">🧵 轨迹尾:开</button>
+            <button id="btnChTrailClear">🧹 清轨迹</button>
+          </div>
           <div class="map-frame">
             <img id="mapImg" alt="map" />
             <canvas id="mapOverlay"></canvas>
@@ -735,6 +739,10 @@
             <label>Y <input id="mvY" type="number" step="0.01" /></label>
             <label>Yaw(rad) <input id="mvYaw" type="number" step="0.1" placeholder="留空=不转" /></label>
             <button id="btnChMove" class="primary">导航</button>
+            <label>最大速度
+              <input id="chMaxSpeed" type="number" step="0.1" min="0.1" max="3" style="width:4.5em" />
+              m/s</label>
+            <button id="btnChSpeedSet">⚡ 设速度</button>
           </div>
           <div class="card">
             <h3>原地旋转</h3>
@@ -765,21 +773,73 @@
             <p class="hint">自动重定位 = 底盘原地旋转扫描重建定位;保存/重载操作设备内置 stcm(RoboStudio 建的图与禁止区域都存在里面),不影响手动 📍 重定位;建图模式开启后移动会持续更新地图(重扫场地图用,完成后记得保存 stcm)</p>
           </div>
           <div class="card">
-            <h3>RoboStudio 点位</h3>
+            <h3>点位(星标)</h3>
             <div id="poiList"><p class="hint">连接后随地图加载</p></div>
+            <button id="btnPoiNew">➕ 新建</button>
+            <div id="poiEditForm" style="display:none">
+              <label>名称 <input id="poiName" size="10" /></label>
+              <label>X <input id="poiX" type="number" step="0.01" style="width:6em" /></label>
+              <label>Y <input id="poiY" type="number" step="0.01" style="width:6em" /></label>
+              <label>Yaw(rad) <input id="poiYaw" type="number" step="0.1" style="width:6em" placeholder="留空=0" /></label>
+              <button id="btnPoiSave" class="primary">保存</button>
+              <button id="btnPoiCancelEdit">取消</button>
+            </div>
+            <details>
+              <summary>📥 导入 CSV(星标)</summary>
+              <input type="file" id="poiCsvFile" accept=".csv,.txt" />
+              <textarea id="poiCsvText" rows="5"
+                placeholder="或粘贴 CSV 内容到这里(可含表头;列:名称,X,Y,Yaw)"></textarea>
+              <button id="btnPoiParse">解析预览</button>
+              <div id="poiCsvPreview"></div>
+              <button id="btnPoiImport" class="primary" disabled>导入</button>
+              <p class="hint">逗号/分号/Tab 分隔都行;解析后核对列映射再导入;Yaw 超 ±6.28 视为角度自动转弧度。写入后自动读回校验坐标</p>
+            </details>
           </div>
           <div class="card">
-            <h3>轨道(网页自建)</h3>
-            <select id="trackSel"></select>
-            <button id="btnTrackRec">➕ 录制</button>
-            <button id="btnTrackClear">清空编辑</button>
-            <button id="btnTrackSave">💾 保存</button>
-            <button id="btnTrackDel">🗑 删除</button>
-            <label>停在第
-              <input id="trackStopIdx" type="number" min="1" style="width:4em" placeholder="末点" />
-              点</label>
-            <button id="btnTrackGo" class="primary">▶ 沿轨移动</button>
-            <div id="trackStatus" class="hint">RoboStudio 的轨道不开放接口,网页自建:点「录制」后在地图上依次点击加路点</div>
+            <h3>🛤️ 沿轨导航(独立设置)</h3>
+            <div class="poi-row">
+              <select id="chNavMode">
+                <option value="0">关 — 自动规划(避障)</option>
+                <option value="1">沿轨道 · 遇障停等</option>
+                <option value="2">沿轨道 · 遇障绕行</option>
+                <option value="3">沿轨道 · 忽略动障直行 ⚠️</option>
+              </select>
+            </div>
+            <div class="poi-row">
+              <select id="chSpeedRatio" title="speed_ratio:本次导航最大速度=全局上限×比例(重启不影响的单次参数)">
+                <option value="1">速度 100%</option>
+                <option value="0.75">速度 75%</option>
+                <option value="0.5">速度 50%</option>
+                <option value="0.3">速度 30%</option>
+                <option value="0.15">速度 15%</option>
+              </select>
+              <label style="font-size:12px"><input type="checkbox" id="chUpNoYaw"> <b>up*</b> 不带朝向</label>
+            </div>
+            <p class="hint">开启后:<b>星标前往 / 巡逻队列 / 地图点选 / 坐标导航</b> 都沿 <b>RoboStudio 画、存在底盘上的虚拟轨道</b>走;停等=遇障停下等待,绕行=脱轨绕过再回轨;<b style="color:#d33">忽略动障直行=带官方 flag avoid_path_ignoring_dynamic_obstacles(思岚飞书 FAQ「直线行驶·方式2」:规划时忽略激光动态障碍、贴轨直行不刹停,静态地图障碍仍在保护)</b>。勾选 up* 项后,名字以 up 开头的点位(如 up1 出口拐弯点)在任何导航模式下都不下发 yaw,到点即止。沿轨开启时点星标/地图点选会弹选择:沿轨前往或自动导航(自由规划,专治沿轨进不去的点位)。选择会记住</p>
+          </div>
+          <div class="card">
+            <h3>巡逻队列(循环跑点)</h3>
+            <div class="poi-row">
+              <select id="patrolPoiSel"></select>
+              <button id="btnPatrolAddPoi">➕入队</button>
+              <button id="btnPatrolAddPose">📍当前位姿入队</button>
+            </div>
+            <div id="patrolQueue"><p class="hint">队列为空</p></div>
+            <div class="poi-row">
+              <label>轮数 <input id="patrolRounds" type="number" min="0" style="width:4em" placeholder="0=无限" /></label>
+              <label>轮间等(s) <input id="patrolPause" type="number" min="0" step="1" value="0" style="width:4em" /></label>
+              <label>段超时(s) <input id="patrolTimeout" type="number" min="10" value="300" style="width:5em" /></label>
+            </div>
+            <button id="btnPatrolStart" class="primary">▶ 开始循环</button>
+            <button id="btnPatrolStop">⏹ 停止</button>
+            <div id="patrolStatus" class="hint">未运行</div>
+            <details>
+              <summary>📋 巡逻日志(每段出发/到达/耗时)</summary>
+              <div id="patrolLive"></div>
+              <div id="patrolLogs"></div>
+              <button id="btnPatrolRefreshLogs">刷新日志列表</button>
+              <a class="btn-link" href="/api/chassis/patrol/logs/export_all" download>⬇ 导出全部(合并 CSV)</a>
+            </details>
           </div>
         </div>
       </div>

@@ -20,7 +20,9 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
+import math
 import os
 import signal
 import subprocess
@@ -195,6 +197,7 @@ class ChassisMoveToBody(BaseModel):
     yaw: Optional[float] = None
     precise: bool = True
     mode: int = 0
+    speed_ratio: Optional[float] = None   # 0.1~1,本次导航速度比例(None=不限制)
 
 
 class ChassisJoystickBody(BaseModel):
@@ -221,8 +224,31 @@ class ChassisMappingBody(BaseModel):
     enable: bool
 
 
+class ChassisMaxSpeedBody(BaseModel):
+    max_moving_speed: float    # m/s,厂商上限 3.0
+
+
 class ChassisTracksBody(BaseModel):
     tracks: list[dict] = []    # [{name, points: [{x, y, yaw?}]}]
+
+
+class ChassisPoiBody(BaseModel):
+    name: str
+    x: float
+    y: float
+    yaw: Optional[float] = None
+
+
+class ChassisPoiEditBody(ChassisPoiBody):
+    id: str
+
+
+class ChassisPoiIdBody(BaseModel):
+    id: str
+
+
+class ChassisPoiImportBody(BaseModel):
+    pois: list[dict]          # [{name, x, y, yaw?}]
 
 
 class CameraStartBody(BaseModel):
@@ -910,13 +936,112 @@ async def chassis_pois():
         raise _err(str(e), 502)
 
 
+def _poi_write_verified(ch, poi_id: str, x: float, y: float,
+                        yaw: Optional[float]) -> tuple[bool, dict]:
+    """写入后读回校验:固件若忽略 POST 里的 pose,点位会落在 (0,0)。"""
+    try:
+        pose = ch.get_poi(poi_id).get("pose") or {}
+        if abs(pose.get("x", 0.0) - x) > 1e-3 or abs(pose.get("y", 0.0) - y) > 1e-3:
+            return False, pose
+        if yaw is not None and abs(pose.get("yaw", 0.0) - yaw) > 1e-3:
+            return False, pose
+        return True, pose
+    except SlamtecError:
+        return False, {}
+
+
+async def _poi_add_verified(name: str, x: float, y: float,
+                            yaw: Optional[float]) -> dict:
+    ch = STATE.chassis_obj
+    pid = await _call(ch.add_poi, name, x, y, yaw)
+    verified, pose = await _call(_poi_write_verified, ch, pid, x, y, yaw)
+    return {"name": name, "ok": True, "poi_id": pid,
+            "verified": verified, "pose": pose}
+
+
+@app.post("/api/chassis/pois/add")
+async def chassis_poi_add(body: ChassisPoiBody):
+    """新建点位,写后读回校验坐标是否生效。"""
+    if not STATE.chassis_obj:
+        raise _err("底盘未连接", 409)
+    if not body.name.strip():
+        raise _err("名称不能为空")
+    try:
+        return await _poi_add_verified(body.name.strip(), body.x, body.y, body.yaw)
+    except SlamtecError as e:
+        raise _err(str(e), 502)
+
+
+@app.post("/api/chassis/pois/edit")
+async def chassis_poi_edit(body: ChassisPoiEditBody):
+    """编辑 = 删旧建新(id 变化,名称/坐标以表单为准)。"""
+    if not STATE.chassis_obj:
+        raise _err("底盘未连接", 409)
+    if not body.name.strip():
+        raise _err("名称不能为空")
+    try:
+        await _call(STATE.chassis_obj.delete_poi, body.id)
+        return await _poi_add_verified(body.name.strip(), body.x, body.y, body.yaw)
+    except SlamtecError as e:
+        raise _err(str(e), 502)
+
+
+@app.post("/api/chassis/pois/delete")
+async def chassis_poi_delete(body: ChassisPoiIdBody):
+    if not STATE.chassis_obj:
+        raise _err("底盘未连接", 409)
+    try:
+        await _call(STATE.chassis_obj.delete_poi, body.id)
+        return {"ok": True, "id": body.id}
+    except SlamtecError as e:
+        raise _err(str(e), 502)
+
+
+@app.post("/api/chassis/pois/import")
+async def chassis_poi_import(body: ChassisPoiImportBody):
+    """批量导入(网页解析好的 CSV 行)。"""
+    if not STATE.chassis_obj:
+        raise _err("底盘未连接", 409)
+    if not body.pois:
+        raise _err("没有可导入的点位")
+    results = []
+    for row in body.pois:
+        name = str(row.get("name", "")).strip()
+        try:
+            x, y = float(row["x"]), float(row["y"])
+        except (KeyError, TypeError, ValueError):
+            results.append({"name": name, "ok": False, "error": "x/y 非数字"})
+            continue
+        yaw = row.get("yaw")
+        try:
+            yaw = float(yaw) if yaw is not None else None
+        except (TypeError, ValueError):
+            yaw = None
+        if not name:
+            results.append({"name": name, "ok": False, "error": "名称为空"})
+            continue
+        try:
+            results.append(await _poi_add_verified(name, x, y, yaw))
+        except SlamtecError as e:
+            results.append({"name": name, "ok": False, "error": str(e)})
+    ok_n = sum(1 for r in results if r.get("ok"))
+    bad_n = sum(1 for r in results if r.get("ok") and not r.get("verified"))
+    return {"ok": True, "total": len(results), "ok_count": ok_n,
+            "unverified_count": bad_n, "results": results}
+
+
 @app.post("/api/chassis/move_to")
 async def chassis_move_to(body: ChassisMoveToBody):
     if not STATE.chassis_obj:
         raise _err("底盘未连接", 409)
+    mode = int(body.mode or 0)
     try:
+        # mode 3 = 沿轨(严格) + 忽略激光动态障碍(官方 flag,沿轨直行不刹停)
+        ign_dyn = mode == 3
+        nav_mode = 1 if ign_dyn else mode
         action_id = await _call(STATE.chassis_obj.move_to, body.x, body.y,
-                                body.yaw, body.precise, body.mode)
+                                body.yaw, body.precise, nav_mode, ign_dyn,
+                                body.speed_ratio)
         return {"ok": True, "action_id": action_id}
     except SlamtecError as e:
         raise _err(str(e), 502)
@@ -1053,6 +1178,36 @@ async def chassis_speed():
         raise _err(str(e), 502)
 
 
+@app.get("/api/chassis/max_speed")
+async def chassis_max_speed_get():
+    """导航最大速度(base.max_moving_speed,m/s)。"""
+    if not STATE.chassis_obj:
+        raise _err("底盘未连接", 409)
+    try:
+        v = await _call(STATE.chassis_obj.get_system_parameter,
+                        "base.max_moving_speed")
+        return {"max_moving_speed": float(v)}
+    except (SlamtecError, TypeError, ValueError) as e:
+        raise _err(f"读取速度参数失败: {e}", 502)
+
+
+@app.post("/api/chassis/max_speed")
+async def chassis_max_speed_set(body: ChassisMaxSpeedBody):
+    """设置导航最大速度(即时生效,影响点导航/沿轨/巡逻;读回校验)。"""
+    if not STATE.chassis_obj:
+        raise _err("底盘未连接", 409)
+    if not 0.05 <= body.max_moving_speed <= 3.0:
+        raise _err("速度范围 0.05~3.0 m/s")
+    try:
+        await _call(STATE.chassis_obj.set_system_parameter,
+                    "base.max_moving_speed", body.max_moving_speed)
+        v = await _call(STATE.chassis_obj.get_system_parameter,
+                        "base.max_moving_speed")
+        return {"ok": True, "max_moving_speed": float(v)}
+    except (SlamtecError, TypeError, ValueError) as e:
+        raise _err(f"设置速度失败: {e}", 502)
+
+
 @app.get("/api/chassis/homedocks")
 async def chassis_homedocks():
     """充电桩位置列表。"""
@@ -1130,6 +1285,309 @@ async def chassis_tracks_save(body: ChassisTracksBody):
     except OSError as e:
         raise _err(f"轨道保存失败: {e}", 500)
     return {"ok": True, "count": len(body.tracks)}
+
+
+# ===========================================================================
+# 巡逻队列(循环跑点)—— 后端驱动,浏览器关掉也继续;每段耗时落 CSV
+# ===========================================================================
+PATROL_LOG_DIR = Path(__file__).resolve().parent / "logs" / "chassis_patrol"
+PATROL: dict = {"st": None, "task": None}
+
+
+class ChassisPatrolBody(BaseModel):
+    points: list[dict]           # [{name, x, y, yaw?}] 按顺序循环
+    rounds: int = 0              # 0 = 无限循环
+    round_pause_s: float = 0.0   # 每轮结束原处等待
+    leg_timeout_s: float = 300.0  # 单段(去一个点)超时
+    nav_mode: int = 0            # 0 自动规划 / 1 沿轨停等 / 2 沿轨绕行 / 3 沿轨+忽略动态障碍
+    speed_ratio: Optional[float] = None  # 0.1~1,每段导航速度比例(None=不限制)
+
+
+_PATROL_COLS = ["时间", "轮次", "序号", "点位", "X", "Y", "Yaw",
+                "出发", "到达", "耗时s", "结果", "备注"]
+
+
+def _patrol_log_write(log_path: Path, row: dict) -> None:
+    # BOM 只在新建文件时写一次(utf-8-sig 追加模式会把 BOM 插到文件中间)
+    newfile = not log_path.exists()
+    with log_path.open("a", encoding="utf-8", newline="") as f:
+        if newfile:
+            f.write("﻿")
+        w = csv.DictWriter(f, fieldnames=_PATROL_COLS)
+        if newfile:
+            w.writeheader()
+        w.writerow({c: row.get(c, "") for c in _PATROL_COLS})
+
+
+async def _patrol_wait_action(action_id: int, st: dict) -> tuple[bool, str]:
+    """轮询 action 到结束。stop 置位/超时 → 取消当前动作并返回 False。"""
+    ch = STATE.chassis_obj
+    t0 = time.time()
+    while not st["stop"]:
+        if time.time() - t0 > st["leg_timeout_s"]:
+            try:
+                await _call(ch.cancel_action)
+            except SlamtecError:
+                pass
+            return False, "超时"
+        await asyncio.sleep(0.5)
+        try:
+            a = await _call(ch.get_action, action_id)
+        except SlamtecError:
+            return True, ""                      # 查不到 = 已结束被清理
+        s = (a.get("state") or {}).get("status", a.get("status"))
+        if isinstance(s, (int, float)) and s <= 3:
+            continue                              # 0新建/1执行/3暂停
+        if isinstance(s, str) and any(k in s.lower()
+                                      for k in ("run", "wait", "new",
+                                                "start", "pend")):
+            continue
+        return True, ""
+    try:
+        await _call(ch.cancel_action)
+    except SlamtecError:
+        pass
+    return False, "停止"
+
+
+async def _patrol_leg(ch, st: dict, pt: dict) -> tuple[bool, str, str]:
+    """走一"腿":带 path(轨道密点)则逐点链走(中间点不精停,终点精停+朝向),
+    否则单次 move_to。nav_mode>0 时按底盘虚拟轨道走(单次 move_to 带 mode)。
+    返回 (ok, reason, note)。"""
+    nav_mode = int(st.get("nav_mode") or 0)
+    pt_over = pt.get("nav_mode") is not None
+    if pt_over:                        # 点级覆盖:这一腿单独用该模式(如 0=自动导航)
+        nav_mode = int(pt["nav_mode"])
+    if nav_mode:
+        # 3 = 沿轨(严格) + 忽略激光动态障碍(官方 flag,搜路失败时忽略动障重搜)
+        ign_dyn = nav_mode == 3
+        try:
+            aid = await _call(ch.move_to, pt["x"], pt["y"],
+                              pt.get("yaw"), True, 1 if ign_dyn else nav_mode,
+                              ign_dyn, st.get("speed_ratio"))
+        except SlamtecError as e:
+            return False, f"失败({e})", "沿轨(底盘)"
+        ok, reason = await _patrol_wait_action(aid, st)
+        return ok, reason, "沿轨(底盘)"
+    path = pt.get("path") or []
+    note = "自动导航(此点单独)" if pt_over else ""
+    if path:
+        note = f"沿轨 {len(path)} 步"
+        for j, sub in enumerate(path):
+            if st["stop"]:
+                return False, "停止", note
+            last = (j == len(path) - 1)
+            yaw = sub.get("yaw") if last else None   # 仅终点带朝向
+            try:
+                aid = await _call(ch.move_to, float(sub["x"]), float(sub["y"]),
+                                  yaw, last)
+            except SlamtecError as e:
+                return False, f"失败({e})", note
+            ok, reason = await _patrol_wait_action(aid, st)
+            if not ok:
+                return ok, reason, note
+        return True, "", note
+    try:
+        aid = await _call(ch.move_to, pt["x"], pt["y"], pt.get("yaw"),
+                          True, 0, False, st.get("speed_ratio"))
+    except SlamtecError as e:
+        return False, f"失败({e})", note
+    ok, reason = await _patrol_wait_action(aid, st)
+    return ok, reason, note
+
+
+async def _patrol_task(st: dict) -> None:
+    ch = STATE.chassis_obj
+    log_path = st["log_path"]
+    rnd = 0
+    try:
+        while not st["stop"] and (st["rounds"] == 0 or rnd < st["rounds"]):
+            rnd += 1
+            st["cur_round"] = rnd
+            round_t0 = time.time()
+            for i, pt in enumerate(st["points"]):
+                if st["stop"]:
+                    break
+                st["cur_idx"] = i + 1
+                st["cur_pt"] = pt["name"]
+                depart = time.time()
+                st["cur_leg_start"] = depart
+                ok, reason, note = await _patrol_leg(ch, st, pt)
+                arrive = time.time()
+                result = "ok" if ok else (reason or "停止")
+                row = _patrol_row(rnd, i + 1, pt, depart, arrive, result, note)
+                _patrol_log_write(log_path, row)
+                st["recent"].append(row)
+                if not ok:
+                    st["last_error"] = f"第 {rnd} 轮第 {i + 1} 点 {result}"
+                    return
+            row = _patrol_row(rnd, 0, {"name": "—轮结束—", "x": "", "y": "",
+                                       "yaw": None},
+                              round_t0, time.time(), "ok", "")
+            row["耗时s"] = round(time.time() - round_t0, 1)
+            _patrol_log_write(log_path, row)
+            st["recent"].append(row)
+            st["rounds_done"] = rnd
+            if st["rounds"] == 0 or rnd < st["rounds"]:
+                t0 = time.time()
+                while (not st["stop"] and st["round_pause_s"] > 0
+                       and time.time() - t0 < st["round_pause_s"]):
+                    await asyncio.sleep(0.2)
+    finally:
+        st["running"] = False
+        st["cur_leg_start"] = None
+        try:
+            if st["stop"]:
+                await _call(ch.cancel_action)
+        except SlamtecError:
+            pass
+
+
+def _patrol_row(rnd: int, idx: int, pt: dict, depart: float, arrive: float,
+                result: str, note: str) -> dict:
+    return {"时间": time.strftime("%H:%M:%S"),
+            "轮次": rnd, "序号": idx, "点位": pt.get("name", ""),
+            "X": pt.get("x", ""), "Y": pt.get("y", ""),
+            "Yaw": pt.get("yaw") if pt.get("yaw") is not None else "",
+            "出发": time.strftime("%H:%M:%S", time.localtime(depart)),
+            "到达": time.strftime("%H:%M:%S", time.localtime(arrive)),
+            "耗时s": round(arrive - depart, 1), "结果": result, "备注": note}
+
+
+def _patrol_public(st: dict | None) -> dict:
+    if not st:
+        return {"running": False}
+    return {"running": st["running"], "stop": st["stop"],
+            "cur_round": st["cur_round"], "cur_idx": st["cur_idx"],
+            "cur_pt": st["cur_pt"],
+            "cur_leg_elapsed_s": (round(time.time() - st["cur_leg_start"], 1)
+                                  if st.get("cur_leg_start") else None),
+            "rounds": st["rounds"], "rounds_done": st.get("rounds_done", 0),
+            "points_n": len(st["points"]), "log_file": st["log_path"].name,
+            "nav_mode": st.get("nav_mode", 0),
+            "speed_ratio": st.get("speed_ratio"),
+            "last_error": st.get("last_error", ""),
+            "recent": st["recent"][-50:]}
+
+
+@app.post("/api/chassis/patrol/start")
+async def chassis_patrol_start(body: ChassisPatrolBody):
+    if not STATE.chassis_obj:
+        raise _err("底盘未连接", 409)
+    if PATROL["task"] and not PATROL["task"].done():
+        raise _err("巡逻已在运行,先停止", 409)
+    pts = []
+    for i, p in enumerate(body.points):
+        try:
+            pt = {"name": str(p.get("name") or f"点{i+1}").strip() or f"点{i+1}",
+                  "x": float(p["x"]), "y": float(p["y"]),
+                  "yaw": float(p["yaw"]) if p.get("yaw") is not None else None}
+        except (KeyError, TypeError, ValueError):
+            raise _err(f"第 {i+1} 个点位数据不合法(需要 name/x/y)")
+        # 可选:参照轨道的密点路径(前端由轨道折线展开)
+        raw_path = p.get("path")
+        if raw_path:
+            if not isinstance(raw_path, list) or len(raw_path) > 500:
+                raise _err(f"第 {i+1} 个点的 path 不合法(须为列表且 ≤500 点)")
+            path = []
+            try:
+                for sub in raw_path:
+                    path.append({"x": float(sub["x"]), "y": float(sub["y"]),
+                                 "yaw": (float(sub["yaw"])
+                                         if sub.get("yaw") is not None else None)})
+            except (KeyError, TypeError, ValueError):
+                raise _err(f"第 {i+1} 个点的 path 点数据不合法")
+            pt["path"] = path
+        pts.append(pt)
+    if not pts:
+        raise _err("队列为空")
+    if body.rounds < 0:
+        raise _err("轮数不能为负(0=无限)")
+    PATROL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    st = {"running": True, "stop": False, "points": pts,
+          "nav_mode": min(3, max(0, int(body.nav_mode))),
+                "speed_ratio": (None if body.speed_ratio is None
+                                else max(0.1, min(1.0, float(body.speed_ratio)))),
+          "rounds": int(body.rounds),
+          "round_pause_s": max(0.0, float(body.round_pause_s)),
+          "leg_timeout_s": min(3600.0, max(10.0, float(body.leg_timeout_s))),
+          "cur_round": 0, "cur_idx": 0, "cur_pt": "", "cur_leg_start": None,
+          "log_path": PATROL_LOG_DIR / time.strftime("patrol_%Y%m%d_%H%M%S.csv"),
+          "recent": [], "rounds_done": 0, "last_error": ""}
+    PATROL["st"] = st
+    PATROL["task"] = asyncio.create_task(_patrol_task(st))
+    return {"ok": True, "points": len(pts), "rounds": st["rounds"],
+            "log_file": st["log_path"].name}
+
+
+@app.post("/api/chassis/patrol/stop")
+async def chassis_patrol_stop():
+    st = PATROL.get("st")
+    if st and st["running"]:
+        st["stop"] = True
+        if STATE.chassis_obj:
+            try:
+                await _call(STATE.chassis_obj.cancel_action)
+            except SlamtecError:
+                pass
+    return {"ok": True}
+
+
+@app.get("/api/chassis/patrol/status")
+async def chassis_patrol_status():
+    return _patrol_public(PATROL.get("st"))
+
+
+@app.get("/api/chassis/patrol/logs")
+async def chassis_patrol_logs():
+    files = []
+    if PATROL_LOG_DIR.exists():
+        for f in sorted(PATROL_LOG_DIR.glob("patrol_*.csv"), reverse=True):
+            files.append({"name": f.name,
+                          "size": f.stat().st_size,
+                          "mtime": time.strftime("%m-%d %H:%M",
+                                                 time.localtime(f.stat().st_mtime))})
+    return {"files": files}
+
+
+@app.get("/api/chassis/patrol/logs/download")
+async def chassis_patrol_log_download(file: str):
+    name = Path(file).name
+    if (name != file or not name.startswith("patrol_")
+            or not name.endswith(".csv")):
+        raise _err("文件名不合法", 400)
+    p = PATROL_LOG_DIR / name
+    if not p.exists():
+        raise _err("日志不存在", 404)
+    return FileResponse(p, media_type="text/csv; charset=utf-8",
+                        filename=name)
+
+
+@app.get("/api/chassis/patrol/logs/export_all")
+async def chassis_patrol_logs_export_all():
+    """全部巡逻日志合并导出 CSV(首列=来源文件,Excel 直开)。"""
+    from io import StringIO
+    merged = []
+    for f in sorted(PATROL_LOG_DIR.glob("patrol_*.csv")):
+        try:
+            with f.open("r", encoding="utf-8-sig", newline="") as fh:
+                rd = csv.reader(fh)
+                header = None
+                for row in rd:
+                    if header is None:
+                        header = row          # 跳过各文件自己的表头
+                        continue
+                    merged.append([f.name] + row)
+        except OSError:
+            continue
+    buf = StringIO()
+    w = csv.writer(buf)
+    w.writerow(["文件"] + _PATROL_COLS)
+    w.writerows(merged)
+    return Response(content="﻿" + buf.getvalue(),
+                    media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition":
+                             'attachment; filename="patrol_all.csv"'})
 
 
 # ===========================================================================
