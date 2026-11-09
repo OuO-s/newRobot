@@ -5,16 +5,23 @@
 必须用系统 Python 3.10 运行(GUI 的 conda 3.11 无法导入 tl_kinematics
 的 C 扩展):
 
-    echo '{"op":"rotate",...}' | /usr/bin/python3 ik_helper.py
+    echo '{"op":"rotate",...}' | /usr/bin/python3 ik_helper.py          # 单次
+    /usr/bin/python3 ik_helper.py --server                              # 常驻
 
-从 stdin 读 JSON 请求,stdout 输出单行 JSON 结果。职责:根据当前关节角
-构造目标位姿(相对旋转 / 绝对位姿),用 tl_kinematics 的直线+姿态插值
-规划关节轨迹,由上位机经 /move_robotarm 下发执行。
+从 stdin 读 JSON 请求,stdout 输出 JSON 结果(单次模式整段读入,server
+模式按行一问一答)。职责:根据当前关节角构造目标位姿(相对平移/相对
+旋转/绝对位姿),用 tl_kinematics 的直线+姿态插值规划关节轨迹,由上位
+机经 /move_robotarm 下发执行。
+
+server 模式(2026-11-05):URDF+运动学链按臂缓存只加载一次——单次模式
+每请求要 ~350ms(URDF 解析占大头),笛卡尔点动 150ms 一拍喂不起;
+常驻后纯求解仅需毫秒级。
 
 请求 op:
-  rotate  {"arm","q_deg","axis":"rx|ry|rz","angle_deg","frame":"base|tool"}
-  target  {"arm","q_deg","target_pos_m":[x,y,z],"target_rpy_deg":[r,p,y],
-           "cur_pos_m":[x,y,z],"cur_quat":[x,y,z,w]}   # 当前上报位姿,用于基座偏移换算
+  translate {"arm","q_deg","deltas_m":[dx,dy,dz],"frame":"base|tool"}
+  rotate    {"arm","q_deg","axis":"rx|ry|rz","angle_deg","frame":"base|tool"}
+  target    {"arm","q_deg","target_pos_m":[x,y,z],"target_rpy_deg":[r,p,y],
+             "cur_pos_m":[x,y,z],"cur_quat":[x,y,z,w]}   # 当前上报位姿,用于基座偏移换算
 """
 
 import glob
@@ -41,6 +48,9 @@ URDF_DIRS = (
 )
 NEAR_ZERO_TRAJ_DEG = 0.5     # 与 fd_arm_http 阈值一致
 JUMP_GUARD_MAX_DQ_DEG = 45.0  # 单段直线 IK 关节变化护栏(首尾+相邻路点)
+MAX_TOTAL_DQ_DEG = 135.0     # 自适应分段允许的整段最大重构(90° 合法吸取
+                             # 工位实测需 ~90°;258° 真翻转仍拦)
+MAX_SUBDIV_SEGMENTS = 8      # 分段链式规划的最大段数
 REACH_POS_TOL_M = 5e-3       # 末端到达容差(与 fd_arm_api 近成功容差一致)
 REACH_ROT_TOL_RAD = 5e-2
 JOINT_LIMIT_EPS_DEG = 1e-2
@@ -134,6 +144,43 @@ def _quat_to_R(x, y, z, w):
     ])
 
 
+def _R_to_quat(R):
+    """旋转矩阵 → [x,y,z,w](与 op=fk 分支同款)。"""
+    tr = float(R[0, 0] + R[1, 1] + R[2, 2])
+    if tr > 0.0:
+        w = math.sqrt(tr + 1.0) / 2.0
+        return np.array([(R[2, 1] - R[1, 2]) / (4 * w),
+                         (R[0, 2] - R[2, 0]) / (4 * w),
+                         (R[1, 0] - R[0, 1]) / (4 * w), w])
+    i = max(range(3), key=lambda k: R[k, k])
+    j, k = (i + 1) % 3, (i + 2) % 3
+    t = math.sqrt(max(0.0, 1.0 + R[i, i] - R[j, j] - R[k, k]))
+    q = np.zeros(4)
+    q[i] = t / 2.0
+    q[j] = (R[j, i] + R[i, j]) / (2 * t)
+    q[k] = (R[k, i] + R[i, k]) / (2 * t)
+    q[3] = (R[k, j] - R[j, k]) / (2 * t)
+    return q
+
+
+def _T_interp(T0, T1, s):
+    """SE(3) 插值(位置线性 + 姿态四元数 slerp)—— 自适应分段的子目标。"""
+    T = np.eye(4)
+    T[:3, 3] = T0[:3, 3] + s * (T1[:3, 3] - T0[:3, 3])
+    q0, q1 = _R_to_quat(T0[:3, :3]), _R_to_quat(T1[:3, :3])
+    d = float(np.dot(q0, q1))
+    if d < 0.0:
+        q1, d = -q1, -d
+    if d > 0.9995:
+        q = q0 + s * (q1 - q0)
+        q /= np.linalg.norm(q)
+    else:
+        th = math.acos(min(1.0, d))
+        q = (math.sin((1 - s) * th) * q0 + math.sin(s * th) * q1) / math.sin(th)
+    T[:3, :3] = _quat_to_R(float(q[0]), float(q[1]), float(q[2]), float(q[3]))
+    return T
+
+
 def _inv_T(T):
     """齐次刚体变换求逆。"""
     out = np.eye(4)
@@ -159,17 +206,39 @@ def _max_step_dq_deg(traj):
     return m
 
 
-def main() -> int:
-    try:
-        req = json.loads(sys.stdin.read() or "{}")
-    except json.JSONDecodeError as exc:
-        print(json.dumps({"ok": False, "error": f"请求 JSON 无效: {exc}"}))
-        return 1
+_KIN_CACHE: dict = {}     # (arm, dof) → RobotKinematics(server 模式复用,URDF 只解析一次)
 
+
+def _get_kin(arm, q_deg):
+    """取(或建)该臂的运动学链;返回 (kin, urdf, base_frame, end_frame)。
+    加载失败抛 RuntimeError。C 扩展对象不能挂自定义属性,元数据随元组返回。"""
+    key = (arm, len(q_deg))
+    hit = _KIN_CACHE.get(key)
+    if hit is not None:
+        return hit
+    startup = _load_yaml(os.path.join(FD_WS, "data", "param", "startup.yaml"))
+    profile = _load_yaml(os.path.join(FD_WS, "data", "param",
+                                      "robot_profile.yaml"))
+    model = (startup.get("model") or "").strip()
+    profile["_model"] = model
+    profile["_arm_mode"] = (profile.get("models") or {}).get(
+        model, {}).get("arm_mode") or (profile.get("arm_mode") or "dual")
+    urdf = _resolve_urdf(startup, profile, model)
+    if not urdf:
+        raise RuntimeError(
+            "未找到 URDF(检查 ~/fd_ws/data/param/startup.yaml "
+            "的 urdf_model 与 tl_robot_description 安装)")
+    base_frame, end_frame = _resolve_frames(profile, arm, len(q_deg))
+    kin = RobotKinematics(urdf, base_frame, end_frame)
+    hit = (kin, urdf, base_frame, end_frame)
+    _KIN_CACHE[key] = hit
+    return hit
+
+
+def handle_request(req: dict) -> dict:
+    """单请求处理:dict 进 dict 出(单次/server 两种模式共用)。"""
     def fail(msg, unavailable=False):
-        print(json.dumps({"ok": False, "error": msg,
-                          "unavailable": unavailable}, ensure_ascii=False))
-        return 1
+        return {"ok": False, "error": msg, "unavailable": unavailable}
 
     if not _DEPS_OK:
         return fail(f"系统 Python 缺少 numpy/tl_kinematics: {_DEPS_ERR}",
@@ -180,38 +249,60 @@ def main() -> int:
     op = req.get("op")
     if arm not in ("armleft", "armright") or not q_deg:
         return fail("缺少 arm / q_deg")
-    if op not in ("rotate", "target"):
+    if op not in ("translate", "rotate", "target", "fk"):
         return fail(f"未知 op: {op}")
 
-    startup = _load_yaml(os.path.join(FD_WS, "data", "param", "startup.yaml"))
-    profile = _load_yaml(os.path.join(FD_WS, "data", "param",
-                                      "robot_profile.yaml"))
-    model = (startup.get("model") or "").strip()
-    profile["_model"] = model
-    profile["_arm_mode"] = (profile.get("models") or {}).get(
-        model, {}).get("arm_mode") or (profile.get("arm_mode") or "dual")
-
-    urdf = _resolve_urdf(startup, profile, model)
-    if not urdf:
-        return fail("未找到 URDF(检查 ~/fd_ws/data/param/startup.yaml "
-                    "的 urdf_model 与 tl_robot_description 安装)",
-                    unavailable=True)
-
-    dof = len(q_deg)
-    base_frame, end_frame = _resolve_frames(profile, arm, dof)
     try:
-        kin = RobotKinematics(urdf, base_frame, end_frame)
+        kin, urdf, base_frame, end_frame = _get_kin(arm, q_deg)
+    except RuntimeError as exc:
+        return fail(str(exc), unavailable=True)
     except Exception as exc:
-        return fail(f"运动学初始化失败({base_frame}→{end_frame}): {exc}",
-                    unavailable=True)
+        return fail(f"运动学初始化失败: {exc}", unavailable=True)
+
     if kin.num_joints > len(q_deg):
         return fail(f"关节角数量 {len(q_deg)} 少于 URDF 自由度 "
                     f"{kin.num_joints}")
     q_deg = q_deg[:kin.num_joints]
 
     T_cur = np.asarray(kin.fkine(q_deg), dtype=float)
+
+    if op == "fk":
+        # 纯正解:关节角 → 末端位姿(fkine/URDF 系)。:8000 上报系与它的
+        # 固定安装偏移(实测 ~80mm)由调用方标定后叠加 —— 风暴期免掉
+        # get_end_pose 的 0.6~3s 服务往返。
+        R = T_cur[:3, :3]
+        tr = R[0, 0] + R[1, 1] + R[2, 2]
+        if tr > 0.0:                      # 常规分支(w 最大)
+            w = math.sqrt(tr + 1.0) / 2.0
+            x = (R[2, 1] - R[1, 2]) / (4.0 * w)
+            y = (R[0, 2] - R[2, 0]) / (4.0 * w)
+            z = (R[1, 0] - R[0, 1]) / (4.0 * w)
+        else:                             # 180° 旋转分支,按对角元取轴
+            i = max(range(3), key=lambda k: R[k, k])
+            j, k = (i + 1) % 3, (i + 2) % 3
+            t = math.sqrt(max(0.0, 1.0 + R[i, i] - R[j, j] - R[k, k]))
+            q4 = [0.0, 0.0, 0.0]
+            q4[i] = t / 2.0
+            q4[j] = (R[j, i] + R[i, j]) / (2.0 * t)
+            q4[k] = (R[k, i] + R[i, k]) / (2.0 * t)
+            x, y, z = q4
+            w = (R[k, j] - R[j, k]) / (2.0 * t)
+        return {"ok": True, "pos_m": [float(v) for v in T_cur[:3, 3]],
+                "quat": [float(v) for v in (x, y, z, w)], "frame": "urdf"}
+
     T_target = T_cur.copy()
-    if op == "rotate":
+    if op == "translate":
+        deltas = req.get("deltas_m")
+        if not deltas or len(deltas) != 3:
+            return fail("translate 模式需要 deltas_m=[dx,dy,dz]")
+        frame = (req.get("frame") or "base").lower()
+        if frame not in ("base", "tool"):
+            return fail(f"未知坐标系: {frame}")
+        d = np.array([float(v) for v in deltas], dtype=float)
+        # base 系:沿基座轴平移;tool 系:沿末端当前姿态的轴平移
+        T_target[:3, 3] += (np.eye(3) if frame == "base"
+                            else T_cur[:3, :3]) @ d
+    elif op == "rotate":
         axis = (req.get("axis") or "").lower()
         axis_map = {"rx": (1.0, 0.0, 0.0), "ry": (0.0, 1.0, 0.0),
                     "rz": (0.0, 0.0, 1.0)}
@@ -247,61 +338,142 @@ def main() -> int:
             T_offset = T_rep @ _inv_T(T_cur)   # 上报系 = T_offset @ fkine系
             T_target = _inv_T(T_offset) @ T_target
 
-    try:
-        traj = kin.straightline(T_target=T_target, T_current=T_cur,
-                                q_initial=q_deg, num_points=NUM_POINTS)
-    except Exception as exc:
-        return fail(f"直线规划失败: {exc}")
-    traj = [[float(v) for v in pt] for pt in (traj or [])]
-    if not traj or any(len(pt) != kin.num_joints for pt in traj):
-        return fail("规划结果为空或维度不符")
-
-    for pt in traj:
-        if not all(math.isfinite(v) for v in pt):
-            return fail("规划结果含非有限值(目标位姿可能不可达)")
-
+    # ---------- 直线规划 + 自适应分段(2026-11-09) ----------
     lower = list(kin.joint_lower or [])
     upper = list(kin.joint_upper or [])
-    if len(lower) >= kin.num_joints and len(upper) >= kin.num_joints:
-        for i, pt in enumerate(traj):
-            for j in range(kin.num_joints):
-                if upper[j] > lower[j] and not (
-                        lower[j] - JOINT_LIMIT_EPS_DEG <= pt[j]
-                        <= upper[j] + JOINT_LIMIT_EPS_DEG):
-                    return fail(f"轨迹点 {i} 关节 {j + 1}={pt[j]:.2f}° "
-                                f"超出限位 [{lower[j]:.1f}, {upper[j]:.1f}]")
 
-    max_dq = _max_dq_deg(traj)
-    if max_dq < NEAR_ZERO_TRAJ_DEG:
+    def _seg_plan(T_from, T_to, q_from):
+        """一段直线:规划+全套校验。返回 (traj|None, err|None, max_dq)。
+        err="NEAR_ZERO" = 起终位姿几乎一致(整段无需运动),由上层定夺。"""
+        try:
+            traj = kin.straightline(T_target=T_to, T_current=T_from,
+                                    q_initial=q_from, num_points=NUM_POINTS)
+        except Exception as exc:
+            return None, f"直线规划失败: {exc}", 0.0
+        traj = [[float(v) for v in pt] for pt in (traj or [])]
+        if not traj or any(len(pt) != kin.num_joints for pt in traj):
+            return None, "规划结果为空或维度不符", 0.0
+        for pt in traj:
+            if not all(math.isfinite(v) for v in pt):
+                return None, "规划结果含非有限值(目标位姿可能不可达)", 0.0
+        if len(lower) >= kin.num_joints and len(upper) >= kin.num_joints:
+            for i, pt in enumerate(traj):
+                for j in range(kin.num_joints):
+                    if upper[j] > lower[j] and not (
+                            lower[j] - JOINT_LIMIT_EPS_DEG <= pt[j]
+                            <= upper[j] + JOINT_LIMIT_EPS_DEG):
+                        return None, (f"轨迹点 {i} 关节 {j + 1}={pt[j]:.2f}° "
+                                      f"超出限位 [{lower[j]:.1f}, "
+                                      f"{upper[j]:.1f}]"), 0.0
+        max_dq = _max_dq_deg(traj)
+        if max_dq < NEAR_ZERO_TRAJ_DEG:
+            return None, "NEAR_ZERO", max_dq
+        # 跳解护栏(单段): 腕部奇异附近(如料仓观察位 J5≈-2°,2026-10-23)
+        # 数值 IK 会收敛到等价解分支——首尾关节翻转 70~258° 而末端位姿与
+        # 目标一致,FK 验证拦不住;跳解轨迹下发后大行程翻转走不完,以
+        # arrival timeout 收场。正常单段(闸门修正/重锚)关节变化实测
+        # ≤20°;首尾超 45° 但**相邻路点无翻转**的连续大重构(2026-11-09
+        # 吸取工位:扫描位→袋面 J1 合法转 ~90°,解随深度单调连续)走
+        # 下方自适应分段,每段仍受全部护栏约束。
+        if max_dq > JUMP_GUARD_MAX_DQ_DEG:
+            return None, (f"跳解护栏: 关节最大变化 {max_dq:.1f}° > "
+                          f"{JUMP_GUARD_MAX_DQ_DEG:.0f}°(解分支翻转)"), \
+                max_dq
+        if _max_step_dq_deg(traj) > JUMP_GUARD_MAX_DQ_DEG:
+            return None, (f"跳解护栏: 相邻路点关节最大变化 "
+                          f"{_max_step_dq_deg(traj):.1f}° > "
+                          f"{JUMP_GUARD_MAX_DQ_DEG:.0f}°(轨迹中途翻转)"), \
+                max_dq
+        T_end = np.asarray(kin.fkine(traj[-1]), dtype=float)
+        pos_err = float(np.linalg.norm(T_end[:3, 3] - T_to[:3, 3]))
+        rot_err = float(np.linalg.norm(
+            _skew_vec(T_to[:3, :3] @ T_end[:3, :3].T)))
+        if pos_err > REACH_POS_TOL_M or rot_err > REACH_ROT_TOL_RAD:
+            return None, (f"目标位姿不可达(末端误差 pos={pos_err * 1000:.1f}"
+                          f"mm rot={math.degrees(rot_err):.2f}°)"), max_dq
+        return traj, None, max_dq
+
+    traj, err, max_dq = _seg_plan(T_cur, T_target, q_deg)
+    if err == "NEAR_ZERO":
         return fail(f"目标与当前位姿几乎一致(最大关节变化 {max_dq:.3f}°),"
                     "无需运动")
-    # 跳解护栏: 腕部奇异附近(如料仓观察位 J5≈-2°,2026-10-23)数值 IK
-    # 会收敛到等价解分支 —— 首尾关节翻转 70~258°,而末端位姿与目标一致,
-    # 下方 pos_err/rot_err 验证拦不住;跳解轨迹下发后大行程翻转走不完,
-    # 以 arrival timeout 收场。正常单段(闸门修正/重锚/吸取)关节变化
-    # 实测 ≤20°,45° 足够宽松又远低于任何跳解。
-    if max_dq > JUMP_GUARD_MAX_DQ_DEG:
-        return fail(f"跳解护栏: 关节最大变化 {max_dq:.1f}° > "
-                    f"{JUMP_GUARD_MAX_DQ_DEG:.0f}°(解分支翻转),拒绝下发")
-    if _max_step_dq_deg(traj) > JUMP_GUARD_MAX_DQ_DEG:
-        return fail(f"跳解护栏: 相邻路点关节最大变化 "
-                    f"{_max_step_dq_deg(traj):.1f}° > "
-                    f"{JUMP_GUARD_MAX_DQ_DEG:.0f}°(轨迹中途翻转),拒绝下发")
+    subdiv, note = 0, ""
+    if err is not None and err.startswith("跳解护栏: 关节最大变化") \
+            and max_dq <= MAX_TOTAL_DQ_DEG:
+        # 首尾超限但量级在合法重构范围内 → 按几何等分链式细分重试:
+        # 每段独立过护栏(首尾+相邻)+FK 到位校验,链式取实际解推进;
+        # 中途翻转/任段不可达/超总重构上限则维持原拒绝。
+        for k in (2, 3, 4, 6, MAX_SUBDIV_SEGMENTS):
+            if k * JUMP_GUARD_MAX_DQ_DEG < max_dq:
+                continue                      # 段数不够把每段压进 45°
+            q_i, T_i, chain, broken = list(q_deg), T_cur, [], None
+            for i in range(1, k + 1):
+                T_sub = _T_interp(T_cur, T_target, i / k)
+                t, e, _ = _seg_plan(T_i, T_sub, q_i)
+                if e == "NEAR_ZERO":
+                    continue                  # 该子段已到位,跳过
+                if e is not None:
+                    broken = e
+                    break
+                chain.extend(t if not chain else t[1:])
+                q_i = list(t[-1])
+                T_i = np.asarray(kin.fkine(q_i), dtype=float)
+            if broken is not None or not chain:
+                continue
+            T_end = np.asarray(kin.fkine(chain[-1]), dtype=float)
+            pos_err = float(np.linalg.norm(T_end[:3, 3] - T_target[:3, 3]))
+            rot_err = float(np.linalg.norm(
+                _skew_vec(T_target[:3, :3] @ T_end[:3, :3].T)))
+            if pos_err <= REACH_POS_TOL_M and rot_err <= REACH_ROT_TOL_RAD:
+                traj, err, subdiv = chain, None, k
+                note = (f"整段重构 {max_dq:.0f}° 超单段护栏,"
+                        f"分 {k} 段链式规划")
+                break
+    if err is not None:
+        return fail(err + ("(自适应分段后仍不可行,拒绝下发)"
+                           if err.startswith("跳解护栏") else ""))
 
-    T_end = np.asarray(kin.fkine(traj[-1]), dtype=float)
-    pos_err = float(np.linalg.norm(T_end[:3, 3] - T_target[:3, 3]))
-    rot_err = float(np.linalg.norm(
-        _skew_vec(T_target[:3, :3] @ T_end[:3, :3].T)))
-    if pos_err > REACH_POS_TOL_M or rot_err > REACH_ROT_TOL_RAD:
-        return fail(f"目标位姿不可达(末端误差 pos={pos_err * 1000:.1f}mm "
-                    f"rot={math.degrees(rot_err):.2f}°)")
+    max_dq = _max_dq_deg(traj)
+    return {"ok": True, "waypoints_deg": traj,
+            "max_dq_deg": round(max_dq, 3),
+            "subdivisions": subdiv, "note": note,
+            "urdf": urdf, "base_frame": base_frame,
+            "end_frame": end_frame, "num_points": len(traj)}
 
-    print(json.dumps({"ok": True, "waypoints_deg": traj,
-                      "max_dq_deg": round(max_dq, 3),
-                      "urdf": urdf, "base_frame": base_frame,
-                      "end_frame": end_frame, "num_points": len(traj)},
-                     ensure_ascii=False))
-    return 0
+
+def _serve() -> int:
+    """常驻模式:按行读请求,一行一个 JSON 响应。stderr 只留给致命错误。"""
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            return 0                       # 对端关闭,正常退出
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError as exc:
+            out = {"ok": False, "error": f"请求 JSON 无效: {exc}"}
+        else:
+            try:
+                out = handle_request(req)
+            except Exception as exc:       # 兜底:不让 server 挂掉
+                out = {"ok": False, "error": f"内部异常: {exc}"}
+        sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+
+def main() -> int:
+    if "--server" in sys.argv[1:]:
+        return _serve()
+    try:
+        req = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError as exc:
+        print(json.dumps({"ok": False, "error": f"请求 JSON 无效: {exc}"}))
+        return 1
+    out = handle_request(req)
+    print(json.dumps(out, ensure_ascii=False))
+    return 0 if out.get("ok") else 1
 
 
 if __name__ == "__main__":

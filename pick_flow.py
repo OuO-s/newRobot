@@ -397,6 +397,53 @@ class PickJob:
             out = scan_once(self.robot, self.provider, cfg,
                             replay=False, say=self._say)
             rows = out["rows"]
+
+        # ---- ③+ 悬停位回放(纯关节,不过 IK) ----
+        # 扫描位求视野、悬停位求吸取几何;料仓在工作空间边缘时二者不可
+        # 兼得(2026-11-09: 扫描位→袋的笛卡尔 IK 解分支翻转 90°,被 45°
+        # 跳解护栏拒)。悬停位示教于袋上方·与吸取同解枝,扫描后先关节
+        # 回放到此(示教者手动走过的路,无跳解),再从这里小行程下探。
+        hover_pose = cfg.get("hover_pose")
+        if hover_pose:
+            if self.dry_run:
+                self._say("干跑: 跳过悬停位关节回放")
+            else:
+                self._set_phase("hover", 35)
+                tgt = [float(v) for v in hover_pose["joints_deg"]]
+                self._say(f"关节回放悬停位({len(tgt)} 关节,"
+                          f"{hover_pose.get('created', '?')} 示教)")
+                # 大行程关节腿是"停半途仍报 success"高危段: 带到位校验,
+                # 超差(>1.5°)从当前位重发一次(前置当前关节防厂商服务器
+                # 吞重复轨迹)
+                tol, done, err = 1.5, False, None
+                for attempt in range(2):
+                    self._check_abort()
+                    send = [tgt]
+                    if attempt:
+                        cur = self._q_deg()
+                        if len(cur) == len(tgt):
+                            err = max(abs(a - b) for a, b in zip(cur, tgt))
+                            if err <= tol:
+                                done = True
+                                break
+                        self._say(f"悬停位未到位(err={err and round(err, 2)}"
+                                  f"°),从当前位补走")
+                        send = [cur, tgt]
+                    self.robot.move_robotarm_traj(
+                        self.arm, send, 1, cfg["move_timeout_s"],
+                        speed_store.get_speed(self.arm))
+                    time.sleep(0.3)
+                    cur = self._q_deg()
+                    if len(cur) == len(tgt):
+                        err = max(abs(a - b) for a, b in zip(cur, tgt))
+                        if err <= tol:
+                            done = True
+                            break
+                if not done:
+                    raise RobotError(
+                        f"悬停位到位验证失败(关节差 {err and round(err, 2)}°"
+                        f" > {tol}°,补走后仍超差) —— 臂停在当前位,人工检查")
+                self._sleep(cfg["settle_s"])
         for r in rows[:12]:
             self._say(f"#{r['order']} L{r['layer']} {r['cls']} "
                       f"conf={r['conf']:.2f} z={r['z_mm']:.0f}mm "
@@ -452,6 +499,9 @@ class PickJob:
             traj = out.get("waypoints_deg") or []
             if not traj:
                 raise RobotError("逆解未返回轨迹")
+            # ik_helper 自适应分段提示(2026-11-09:大重构整段超 45° 时
+            # 链式细分),透出到日志方便排查
+            self._ik_note = out.get("note") or ""
             return traj
 
         def run_seg(name, pos, rpy, pct, retries=1):
@@ -464,8 +514,10 @@ class PickJob:
                 traj = plan_seg(pos, rpy)
             except RobotError as e:
                 raise _PlanFail(str(e)) from e
+            note = getattr(self, "_ik_note", "")
             self._say(f"{name}: →[{pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f}]m "
-                      f"rpy={np.round(rpy, 1).tolist()}({len(traj)} 路点)")
+                      f"rpy={np.round(rpy, 1).tolist()}({len(traj)} 路点)"
+                      + (f"|{note}" if note else ""))
             if self.dry_run:
                 return
             last_dxy = last_dz = 0.0

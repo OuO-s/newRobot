@@ -43,7 +43,8 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from cartesian import cartesian_delta_move, plan_cartesian_path
+from cartesian import EndPoseFK, cartesian_delta_move, \
+    cartesian_delta_move_ik, plan_cartesian_path
 from ik_config import IK_HELPER, SYS_PYTHON
 from robot_client import RobotError, TianlianRobot
 from services import (AppState, CameraStreamService, ChassisService,
@@ -64,6 +65,9 @@ from flow import (ArmLoop, FlowError, FlowRunner, fix_align_gate,
                   goto_align_ref, record_align_ref, test_align_gate)
 
 STATE = AppState()
+
+# FK 末端位姿快读(报告系;每台 robot 一份,静止时一次性标定安装偏移)
+_END_POSE_FK = None
 
 # 一步到位(吸取):深度取流单例 + 当前任务
 _PICK_PROVIDER = DepthProvider()
@@ -118,8 +122,11 @@ def _ensure_cam_bridge() -> dict:
     # hub 固定在 domain 25;漏设会落在 0 上永远收不到帧(2026-10-28 实证)
     env.setdefault("ROS_DOMAIN_ID", "25")
     env.setdefault("ROS_LOCALHOST_ONLY", "0")
-    # rclpy 只在 ROS2 环境的系统 Python 3.10 里可用(GUI 同款拉起方式)
+    # rclpy 只在 ROS2 环境的系统 Python 3.10 里可用(GUI 同款拉起方式)。
+    # 2026-11-05 再叠 fd_ws overlay:桥内运动代理需要 fd_arm_api/fd_msgs
+    # (follow action 直发,绕开 :8000 在 DDS 风暴下的 5 次往返)。
     cmd = (f"source /opt/ros/humble/setup.bash && "
+           f"source ~/fd_ws/install/setup.bash && "
            f"exec /usr/bin/python3 {script} --port {_CAM_BRIDGE_PORT}")
     log_f = open(script.parent / "logs" / "camera_bridge.log", "ab")
     _CAM_BRIDGE_PROC = subprocess.Popen(["/bin/bash", "-c", cmd],
@@ -141,6 +148,15 @@ def _stop_cam_bridge() -> None:
             except Exception:                          # noqa: BLE001
                 pass
     _CAM_BRIDGE_PROC = None
+
+
+def _ensure_end_pose_fk(robot) -> "EndPoseFK":
+    """末端位姿 FK 快读:首次用到时静止标定安装偏移(一次 :8000 读数),
+    之后毫秒级出报告系位姿。每台 robot 一份(偏移随机不换)。"""
+    global _END_POSE_FK
+    if _END_POSE_FK is None or _END_POSE_FK.robot is not robot:
+        _END_POSE_FK = EndPoseFK(robot)
+    return _END_POSE_FK
 
 
 # ===========================================================================
@@ -379,7 +395,7 @@ app.add_middleware(
 # 健康
 # ===========================================================================
 @app.get("/api/health")
-async def health():
+def health():
     pose_alive = _pose_proc.poll() is None if _POSE_PROC else False
     return {
         "ok": True,
@@ -409,6 +425,7 @@ async def connect_robot(body: ConnectBody):
         arm_ok = await _call(robot.ping_arm)
     except RobotError:
         arm_ok = False
+    robot._end_pose_hook = _ensure_end_pose_fk(robot).pose
     STATE.robot = robot
     STATE.status_poller = StatusPoller(robot)
     STATE.status_poller.start()
@@ -421,7 +438,7 @@ async def connect_robot(body: ConnectBody):
 
 
 @app.post("/api/disconnect")
-async def disconnect_robot():
+def disconnect_robot():
     STATE.disconnect_robot()
     return {"ok": True}
 
@@ -445,6 +462,7 @@ def _auto_resume() -> None:
         try:
             robot = TianlianRobot(**conn)
             if robot.ping_web():
+                robot._end_pose_hook = _ensure_end_pose_fk(robot).pose
                 STATE.robot = robot
                 STATE.status_poller = StatusPoller(robot)
                 STATE.status_poller.start()
@@ -472,7 +490,7 @@ def _auto_resume() -> None:
 # 状态
 # ===========================================================================
 @app.get("/api/status")
-async def get_status():
+def get_status():
     if not STATE.status_poller:
         raise _err("机器人未连接", 409)
     return STATE.status_poller.snapshot()
@@ -496,12 +514,12 @@ async def status_stream():
 # 全局速度(双臂分别)—— 顶栏唯一入口,所有臂运动默认取这里
 # ===========================================================================
 @app.get("/api/speed")
-async def speed_get():
+def speed_get():
     return speed_store.get_speeds()
 
 
 @app.post("/api/speed")
-async def speed_set(body: SpeedBody):
+def speed_set(body: SpeedBody):
     return {"ok": True, "speeds": speed_store.set_speeds(
         {"armleft": body.armleft, "armright": body.armright})}
 
@@ -691,12 +709,43 @@ def _jog_actual(arm: str) -> list[float]:
     return [float(v) for v in arr[:7]]
 
 
+def _joints_cached(arm: str, max_age_ms: int = 1000) -> tuple[list[float], int] | None:
+    """从 camera_bridge 的 /joint_states(100Hz)订阅缓存读关节角。
+
+    返回 (deg×7, age_ms);桥不在/数据过旧/缺关节 → None,调用方回退
+    :8000 阻塞读。DDS 风暴期 :8000 服务往返劣化到 0.6~5s,而话题推送
+    不受影响(2026-11-05 实测 hz=100 std 0.3ms),高频点动改走这里。
+    """
+    import urllib.request
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{_CAM_BRIDGE_PORT}/joints",
+                timeout=0.5) as r:
+            data = json.loads(r.read().decode())
+    except Exception:                                      # noqa: BLE001
+        return None
+    if not data.get("ok"):
+        return None
+    age = data.get("age_ms")
+    deg = data.get("left_deg" if arm == "armleft" else "right_deg")
+    if age is None or age < 0 or age > max_age_ms:
+        return None
+    if not isinstance(deg, list) or len(deg) < 7:
+        return None
+    return [float(v) for v in deg[:7]], int(age)
+
+
 @app.post("/api/arm/joint_jog")
 async def arm_joint_jog(body: JointJogBody):
     """单关节点动:前端按住时以固定周期连续调用,松手停发。
 
     delta 模式基于 jog 游标累加(不受反馈滞后影响),absolute 模式直接
     给目标角并重同步游标。
+
+    关节角来源(2026-11-05):游标锁定期间不读 :8000(游标即基准),
+    反馈角仅用于展示,优先取 camera_bridge 的 /joint_states 100Hz 订阅
+    缓存(本地毫秒级);起步/游标失效时,新鲜缓存(≤150ms)可直接当
+    反馈起步,拿不到才回退 :8000 阻塞读(风暴期 0.6~5s)。
     """
     if not STATE.robot:
         raise _err("机器人未连接", 409)
@@ -704,17 +753,44 @@ async def arm_joint_jog(body: JointJogBody):
     if not 0 <= body.joint <= 6:
         raise _err("joint 必须是 0..6")
 
-    try:
-        actual = await _call(_jog_actual, arm)
-    except RobotError as e:
-        raise _err(f"读关节角失败: {e}", 502)
+    cur = _jog_cursor(arm)
+    with _JOG_LOCK:
+        locked = bool(cur["q"]) and cur["locked"]
+
+    cached = await _call(_joints_cached, arm)     # (deg, age) 或 None
+    actual: list[float] | None = None
+    if locked:
+        src = "cursor"                            # 反馈仅展示,允许旧一些
+        if cached:
+            actual = cached[0]
+    elif cached and cached[1] <= 150:             # 起步:只信新鲜缓存
+        actual = cached[0]
+        src = "bridge"
+    else:
+        try:
+            actual = await _call(_jog_actual, arm)
+        except RobotError as e:
+            raise _err(f"读关节角失败: {e}", 502)
+        src = "arm_http"
 
     cur = _jog_cursor(arm)
     with _JOG_LOCK:
         first_touch = cur["q"] is None
         # 未被接管(空闲) → 以反馈为准起步
-        q = list(cur["q"]) if (cur["q"] and cur["locked"]) else list(actual)
+        q = list(cur["q"]) if (cur["q"] and cur["locked"]) else None
 
+    if q is None:
+        if actual is None:
+            # 竞态兜底:peek 时游标还在,取锁时被并发清掉且缓存又没值
+            try:
+                actual = await _call(_jog_actual, arm)
+            except RobotError as e:
+                raise _err(f"读关节角失败: {e}", 502)
+            src = "arm_http"
+        q = list(actual)
+
+    with _JOG_LOCK:
+        cur = _jog_cursor(arm)
         if body.absolute is not None:
             target = float(body.absolute)
         else:
@@ -736,10 +812,12 @@ async def arm_joint_jog(body: JointJogBody):
             # 被下一拍/新目标抢占:不算失败,游标保持(新指令在它之上继续)
             return {"ok": True, "arm": arm, "joint": body.joint,
                     "commanded_deg": round(clamped, 3),
-                    "actual_deg": round(actual[body.joint], 3),
-                    "lag_deg": round(clamped - actual[body.joint], 3),
+                    "actual_deg": (round(actual[body.joint], 3)
+                                   if actual else None),
+                    "lag_deg": (round(clamped - actual[body.joint], 3)
+                                if actual else None),
                     "at_limit": at_limit, "from_feedback": first_touch,
-                    "preempted": True}
+                    "src": src, "preempted": True}
         # 下发失败:解锁,让下一拍按反馈重新起步,避免游标越飘越远
         with _JOG_LOCK:
             _JOG.pop(arm, None)
@@ -750,15 +828,18 @@ async def arm_joint_jog(body: JointJogBody):
         "arm": arm,
         "joint": body.joint,
         "commanded_deg": round(clamped, 3),   # 已命令到的位置(游标)
-        "actual_deg": round(actual[body.joint], 3),   # 实时反馈
-        "lag_deg": round(clamped - actual[body.joint], 3),
+        # 实时反馈(缓存不可用时为 null,不代表失败)
+        "actual_deg": round(actual[body.joint], 3) if actual else None,
+        "lag_deg": (round(clamped - actual[body.joint], 3)
+                    if actual else None),
         "at_limit": at_limit,
         "from_feedback": first_touch,
+        "src": src,        # cursor=游标 / bridge=话题缓存 / arm_http=:8000
     }
 
 
 @app.post("/api/arm/jog_reset")
-async def arm_jog_reset(arm: str = Query("armleft")):
+def arm_jog_reset(arm: str = Query("armleft")):
     """丢弃 jog 游标,下次点动从实时反馈重新起步。
 
     前端在「开始按住」时调用一次,确保不会接着上一次按住的目标继续走;
@@ -769,12 +850,30 @@ async def arm_jog_reset(arm: str = Query("armleft")):
     return {"ok": True, "arm": arm_n}
 
 
+@app.get("/api/arm/joints")
+async def arm_joints(arm: str = Query("armleft")):
+    """读关节角(只读):优先 /joint_states 话题缓存,回退 :8000。
+
+    返回 src=bridge(带 age_ms)/arm_http,可用于诊断两条链路延迟差。
+    """
+    arm_n = _normalize_arm(arm)
+    cached = await _call(_joints_cached, arm_n, 1000)
+    if cached:
+        return {"ok": True, "arm": arm_n, "deg": cached[0],
+                "src": "bridge", "age_ms": cached[1]}
+    try:
+        actual = await _call(_jog_actual, arm_n)
+    except RobotError as e:
+        raise _err(str(e), 502)
+    return {"ok": True, "arm": arm_n, "deg": actual, "src": "arm_http"}
+
+
 
 # ===========================================================================
 # 相机
 # ===========================================================================
 @app.post("/api/camera/start")
-async def camera_start(body: CameraStartBody):
+def camera_start(body: CameraStartBody):
     if not STATE.camera:
         raise _err("机器人未连接", 409)
     if body.cam not in ("left", "head", "right"):
@@ -786,14 +885,14 @@ async def camera_start(body: CameraStartBody):
 
 
 @app.get("/api/camera/meta")
-async def camera_meta():
+def camera_meta():
     """相机元信息:桥接状态 + 每路帧来源/分辨率(src=ros 为原生无畸变)。"""
     return {"bridge": _cam_bridge_alive(), "bridge_port": _CAM_BRIDGE_PORT,
             "cams": STATE.camera.meta_all() if STATE.camera else {}}
 
 
 @app.post("/api/camera/stop")
-async def camera_stop(cam: str = Query(...)):
+def camera_stop(cam: str = Query(...)):
     resume_store.set_cam(cam, None)     # 先落盘:断连时也要记住"已关"
     if not STATE.camera:
         return {"ok": True}
@@ -802,7 +901,7 @@ async def camera_stop(cam: str = Query(...)):
 
 
 @app.get("/api/camera/snapshot")
-async def camera_snapshot(cam: str = Query("left")):
+def camera_snapshot(cam: str = Query("left")):
     if not STATE.camera:
         raise _err("相机未启动", 409)
     data = STATE.camera.latest(cam)
@@ -866,20 +965,20 @@ async def chassis_connect(body: ChassisConnectBody):
 
 
 @app.post("/api/chassis/disconnect")
-async def chassis_disconnect():
+def chassis_disconnect():
     STATE.disconnect_chassis()
     return {"ok": True}
 
 
 @app.get("/api/chassis/pose")
-async def chassis_pose():
+def chassis_pose():
     if not STATE.chassis_service:
         raise _err("底盘未连接", 409)
     return STATE.chassis_service.pose() or {}
 
 
 @app.get("/api/chassis/laser")
-async def chassis_laser():
+def chassis_laser():
     if not STATE.chassis_service:
         raise _err("底盘未连接", 409)
     return {"laser_points": STATE.chassis_service.laser()}
@@ -1266,7 +1365,7 @@ TRACKS_PATH = Path(__file__).resolve().parent / "chassis_tracks.json"
 
 
 @app.get("/api/chassis/tracks")
-async def chassis_tracks_get():
+def chassis_tracks_get():
     if TRACKS_PATH.exists():
         try:
             return json.loads(TRACKS_PATH.read_text("utf-8"))
@@ -1276,7 +1375,7 @@ async def chassis_tracks_get():
 
 
 @app.post("/api/chassis/tracks")
-async def chassis_tracks_save(body: ChassisTracksBody):
+def chassis_tracks_save(body: ChassisTracksBody):
     """整表保存(前端编辑后回传全部轨道)。"""
     for t in body.tracks:
         if not t.get("name") or not isinstance(t.get("points"), list):
@@ -1537,12 +1636,12 @@ async def chassis_patrol_stop():
 
 
 @app.get("/api/chassis/patrol/status")
-async def chassis_patrol_status():
+def chassis_patrol_status():
     return _patrol_public(PATROL.get("st"))
 
 
 @app.get("/api/chassis/patrol/logs")
-async def chassis_patrol_logs():
+def chassis_patrol_logs():
     files = []
     if PATROL_LOG_DIR.exists():
         for f in sorted(PATROL_LOG_DIR.glob("patrol_*.csv"), reverse=True):
@@ -1554,7 +1653,7 @@ async def chassis_patrol_logs():
 
 
 @app.get("/api/chassis/patrol/logs/download")
-async def chassis_patrol_log_download(file: str):
+def chassis_patrol_log_download(file: str):
     name = Path(file).name
     if (name != file or not name.startswith("patrol_")
             or not name.endswith(".csv")):
@@ -1567,7 +1666,7 @@ async def chassis_patrol_log_download(file: str):
 
 
 @app.get("/api/chassis/patrol/logs/export_all")
-async def chassis_patrol_logs_export_all():
+def chassis_patrol_logs_export_all():
     """全部巡逻日志合并导出 CSV(首列=来源文件,Excel 直开)。"""
     from io import StringIO
     merged = []
@@ -1681,10 +1780,18 @@ async def pose_delete(body: PoseDeleteBody):
 # ===========================================================================
 # 笛卡尔移动
 # ===========================================================================
-def _q_deg(arm: str) -> list:
-    """读取指定臂当前关节角(7 维,度)。"""
+def _q_deg(arm: str, max_age_ms: int = 150) -> list:
+    """读取指定臂当前关节角(7 维,度)。
+
+    优先走 camera_bridge 的 /joint_states 订阅缓存(100Hz,DDS 风暴期
+    :8000 服务往返劣化到 0.6~5s 而话题不受影响);缓存干涸/过旧回落
+    阻塞读 :8000。max_age_ms 提到 1000 可用于纯展示场景。
+    """
     if not STATE.robot:
         raise _err("机器人未连接", 409)
+    got = _joints_cached(arm, max_age_ms)
+    if got:
+        return got[0]
     try:
         data = STATE.robot.get_joint_angles()
     except RobotError as e:
@@ -1708,7 +1815,7 @@ def _end_pose(arm: str) -> dict:
 
 
 @app.get("/api/cartesian/current")
-async def cartesian_current(arm: str = Query("armleft")):
+def cartesian_current(arm: str = Query("armleft")):
     arm_n = _normalize_arm(arm)
     return _end_pose(arm_n)
 
@@ -1724,20 +1831,43 @@ async def cartesian_jog(body: CartJogBody):
         raise _err("frame 必须是 base/tool")
     deltas = {"x": 0.0, "y": 0.0, "z": 0.0}
     deltas[body.axis] = body.distance
+    speed = _speed_of(arm_n, body.speed)
+    # 快路径:桥缓存关节角 → 常驻 ik_helper 求解 → /move_robotarm 整段下发。
+    # 每拍不过 :8000 的 get_state 服务往返+进程内规划(DDS 风暴下最弱一环)。
     try:
-        await _call(cartesian_delta_move, STATE.robot, arm_n,
-                    deltas["x"], deltas["y"], deltas["z"],
-                    speed=_speed_of(arm_n, body.speed), step_m=body.step_m,
-                    frame=body.frame)
+        out = await _call(cartesian_delta_move_ik, STATE.robot, arm_n,
+                          deltas["x"], deltas["y"], deltas["z"],
+                          speed=speed, frame=body.frame,
+                          joints_reader=lambda a: _joints_cached(a, 150))
     except RobotError as e:
-        if _is_preempted(str(e)):
+        msg = str(e)
+        if getattr(e, "planner_unavailable", False):
+            # 逆解环境缺失(系统 Python/tl_kinematics 不可用)→ 回落折线路径
+            try:
+                await _call(cartesian_delta_move, STATE.robot, arm_n,
+                            deltas["x"], deltas["y"], deltas["z"],
+                            speed=speed, step_m=body.step_m,
+                            frame=body.frame)
+            except RobotError as e2:
+                msg2 = str(e2)
+                if _is_preempted(msg2):
+                    return {"ok": True, "preempted": True}
+                if "near-zero trajectory" in msg2:
+                    raise _err("步距过小:厂商接口要求单次平移至少引起 "
+                               "0.5° 关节变化(换算成末端位移随机位姿约 "
+                               "0.5~1mm);建议步距 ≥1mm,更精细的对准请改用"
+                               "目标点移动", 400)
+                raise _err(msg2, 502)
+            return {"ok": True, "src": "fallback_axis"}
+        if _is_preempted(msg):
             return {"ok": True, "preempted": True}
-        if "near-zero trajectory" in str(e):
-            raise _err("步距过小:厂商接口要求单次平移至少引起 0.5° 关节变化"
-                       "(换算成末端位移随机位姿约 0.5~1mm);建议步距 ≥1mm,"
+        if "几乎一致" in msg or "near-zero trajectory" in msg:
+            raise _err("步距过小:本次位移解算出的关节变化 <0.5°,已按"
+                       "无位移忽略(继续按住会随臂移动生效);建议步距 ≥1mm,"
                        "更精细的对准请改用目标点移动", 400)
-        raise _err(str(e), 502)
-    return {"ok": True}
+        raise _err(msg, 502)
+    return {"ok": True, **{k: out.get(k) for k in ("moved", "src",
+                                                   "max_dq_deg")}}
 
 
 @app.post("/api/cartesian/rotate")
@@ -1845,7 +1975,7 @@ def _teach_path(kind: str, name: str) -> Path:
 
 
 @app.get("/api/teach/{kind}/list")
-async def teach_list(kind: str):
+def teach_list(kind: str):
     if kind not in ("joint_teach", "cartesian_teach"):
         raise _err("kind 必须是 joint_teach/cartesian_teach")
     TEACH_DIR.mkdir(parents=True, exist_ok=True)
@@ -1867,7 +1997,7 @@ async def teach_list(kind: str):
 
 
 @app.get("/api/teach/{kind}/load")
-async def teach_load(kind: str, name: str = Query(...)):
+def teach_load(kind: str, name: str = Query(...)):
     if kind not in ("joint_teach", "cartesian_teach"):
         raise _err("kind 必须是 joint_teach/cartesian_teach")
     p = _teach_path(kind, name)
@@ -1881,7 +2011,7 @@ async def teach_load(kind: str, name: str = Query(...)):
 
 
 @app.delete("/api/teach/{kind}/delete")
-async def teach_delete(kind: str, name: str = Query(...)):
+def teach_delete(kind: str, name: str = Query(...)):
     if kind not in ("joint_teach", "cartesian_teach"):
         raise _err("kind 必须是 joint_teach/cartesian_teach")
     p = _teach_path(kind, name)
@@ -1891,7 +2021,7 @@ async def teach_delete(kind: str, name: str = Query(...)):
 
 
 @app.post("/api/teach/save")
-async def teach_save(body: TeachSaveBody):
+def teach_save(body: TeachSaveBody):
     if body.kind not in ("joint_teach", "cartesian_teach"):
         raise _err("kind 必须是 joint_teach/cartesian_teach")
     if not body.name.strip():
@@ -2034,7 +2164,7 @@ def _stop_pose_proc() -> None:
 
 
 @app.get("/api/pose_service/health")
-async def pose_service_health():
+def pose_service_health():
     import urllib.request
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{_POSE_PORT}/health",
@@ -2051,7 +2181,7 @@ async def pose_service_health():
 
 
 @app.post("/api/pose_service/start")
-async def pose_service_start():
+def pose_service_start():
     global _POSE_PROC
     if _POSE_PROC and _POSE_PROC.poll() is None:
         return {"ok": True, "already_running": True, "pid": _POSE_PROC.pid}
@@ -2094,7 +2224,7 @@ async def pose_service_start():
 
 
 @app.post("/api/pose_service/stop")
-async def pose_service_stop():
+def pose_service_stop():
     _stop_pose_proc()
     return {"ok": True}
 
@@ -2161,7 +2291,7 @@ def _pick_robot():
 
 
 @app.get("/api/pick/config")
-async def pick_config_get():
+def pick_config_get():
     cfg = pick_store.load_config()
     local_w = Path(__file__).resolve().parent / "models" / "weilong_pose_best.pt"
     return {
@@ -2179,7 +2309,7 @@ async def pick_config_get():
 
 
 @app.post("/api/pick/config")
-async def pick_config_set(body: dict):
+def pick_config_set(body: dict):
     try:
         cfg = pick_store.update_config(body or {})
     except ValueError as e:
@@ -2188,12 +2318,12 @@ async def pick_config_set(body: dict):
 
 
 @app.get("/api/pick/depth/health")
-async def pick_depth_health():
+def pick_depth_health():
     return _PICK_PROVIDER.health()
 
 
 @app.post("/api/pick/teach/scan_pose")
-async def pick_teach_scan_pose():
+def pick_teach_scan_pose():
     """把当前关节角+末端位姿存为扫描位(不动臂)。"""
     robot = _pick_robot()
     cfg = pick_store.load_config()
@@ -2215,8 +2345,39 @@ async def pick_teach_scan_pose():
             "hint": "扫描位已更新;若之前做过对准校正,建议复验一次"}
 
 
+@app.post("/api/pick/teach/hover_pose")
+def pick_teach_hover_pose(clear: bool = False):
+    """存/清除吸取悬停位(袋上方·与吸取同解枝;不动臂)。
+
+    吸取流程变为: 扫描位扫描 → 关节回放悬停位 → 小行程笛卡尔下探。
+    ?clear=1 清除(回退为扫描位直接吸取)。"""
+    robot = _pick_robot()
+    cfg = pick_store.load_config()
+    if clear:
+        cfg["hover_pose"] = None
+        pick_store.save_config(cfg)
+        return {"ok": True, "hover_pose": None, "hint": "悬停位已清除,"
+                "吸取回到扫描位直接下探"}
+    arm = cfg.get("arm", "armleft")
+    try:
+        q = robot.get_joint_angles().get(arm) or []
+        ep = robot.get_end_poses().get(arm) or {}
+    except RobotError as e:
+        raise _err(str(e), 502)
+    if not q or not ep.get("position"):
+        raise _err("读取当前关节/位姿失败(臂未上电?)", 502)
+    cfg["hover_pose"] = {
+        "joints_deg": [round(float(v), 3) for v in q],
+        "end_pose": ep,
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    pick_store.save_config(cfg)
+    return {"ok": True, "hover_pose": cfg["hover_pose"],
+            "hint": "悬停位已更新;吸取将: 扫描位扫描→关节回放悬停位→小行程下探"}
+
+
 @app.post("/api/pick/teach/align")
-async def pick_teach_align(body: PickAlignBody):
+def pick_teach_align(body: PickAlignBody):
     """人工微调吸嘴到正确吸附点后存残差 + 对准姿态基准。"""
     robot = _pick_robot()
     cfg = pick_store.load_config()
@@ -2269,7 +2430,7 @@ async def pick_scan(body: PickScanBody):
 
 
 @app.post("/api/pick/start")
-async def pick_start(body: PickStartBody):
+def pick_start(body: PickStartBody):
     global _PICK_JOB
     robot = _pick_robot()
     if _FLOW.running:
@@ -2293,14 +2454,14 @@ async def pick_start(body: PickStartBody):
 
 
 @app.get("/api/pick/status")
-async def pick_status():
+def pick_status():
     if _PICK_JOB is None:
         return {"running": False, "phase": "idle"}
     return _PICK_JOB.status()
 
 
 @app.post("/api/pick/stop")
-async def pick_stop():
+def pick_stop():
     if _PICK_JOB is None or _PICK_JOB._done:
         return {"ok": True, "note": "无运行中的任务"}
     _PICK_JOB.abort_event.set()
@@ -2367,7 +2528,12 @@ def _flow_guard_moving():
 
 
 @app.get("/api/flow/config")
-async def flow_config_get():
+def flow_config_get():
+    return _flow_config_payload()
+
+
+def _flow_config_payload() -> dict:
+    """flow 配置页一次性载荷(配置 + 就绪 + 方案列表)。"""
     cfg = flow_store.load_config()
     return {
         "config": cfg,
@@ -2376,11 +2542,60 @@ async def flow_config_get():
         "actions_meta": flow_store.ACTIONS_META,
         "post_grip_slots": flow_store.POST_GRIP_SLOTS,
         "pick_scan_pose": bool(pick_store.load_config().get("scan_pose")),
+        "flows": {"active": flow_store.active_flow(),
+                  "list": flow_store.list_flows()},
     }
 
 
+@app.get("/api/flow/flows")
+def flow_flows_list():
+    return {"active": flow_store.active_flow(),
+            "flows": flow_store.list_flows()}
+
+
+class FlowNameBody(BaseModel):
+    name: str
+    copy_from: str | None = None      # 新建用:空串=空白骨架,None=克隆当前
+
+
+@app.post("/api/flow/flows/active")
+def flow_flows_switch(body: FlowNameBody):
+    _flow_guard_moving()               # 运行中不换方案(引擎按方案缓存)
+    try:
+        flow_store.set_active_flow(body.name)
+    except ValueError as e:
+        raise _err(str(e), 400)
+    return _flow_config_payload()
+
+
+@app.post("/api/flow/flows/create")
+def flow_flows_create(body: FlowNameBody):
+    """新建方案:默认克隆当前(改完互不影响);copy_from="" 为空白骨架。
+    建好自动切换到新方案。"""
+    _flow_guard_moving()
+    try:
+        src = body.copy_from if body.copy_from is not None \
+            else flow_store.active_flow()
+        name = flow_store.create_flow(body.name, copy_from=src or None)
+        flow_store.set_active_flow(name)
+    except ValueError as e:
+        raise _err(str(e), 400)
+    return _flow_config_payload()
+
+
+@app.post("/api/flow/flows/delete")
+def flow_flows_delete(body: FlowNameBody):
+    _flow_guard_moving()
+    try:
+        flow_store.delete_flow(body.name)
+    except ValueError as e:
+        raise _err(str(e), 400)
+    return {"ok": True, "active": flow_store.active_flow(),
+            "flows": flow_store.list_flows()}
+
+
 @app.post("/api/flow/config")
-async def flow_config_set(body: dict):
+def flow_config_set(body: dict):
     try:
         cfg = flow_store.update_config(body or {})
     except ValueError as e:
@@ -2390,7 +2605,7 @@ async def flow_config_set(body: dict):
 
 
 @app.post("/api/flow/teach/waypoint")
-async def flow_teach_waypoint(body: FlowArmActionBody):
+def flow_teach_waypoint(body: FlowArmActionBody):
     """把当前关节角+末端位姿追加为该动作的下一个路点(不动臂)。"""
     _flow_guard_moving()
     robot = _pick_robot()
@@ -2416,7 +2631,7 @@ async def flow_teach_waypoint(body: FlowArmActionBody):
 
 
 @app.post("/api/flow/teach/waypoint/delete")
-async def flow_teach_waypoint_del(body: FlowWpDelBody):
+def flow_teach_waypoint_del(body: FlowWpDelBody):
     try:
         flow_store.delete_waypoint(_flow_arm(body.arm), body.action,
                                    body.index)
@@ -2426,7 +2641,7 @@ async def flow_teach_waypoint_del(body: FlowWpDelBody):
 
 
 @app.post("/api/flow/teach/waypoint/overwrite")
-async def flow_teach_waypoint_overwrite(body: FlowWpDelBody):
+def flow_teach_waypoint_overwrite(body: FlowWpDelBody):
     """把当前关节角+末端位姿覆盖到第 index 个路点(不动臂,其余点不动)。"""
     _flow_guard_moving()
     robot = _pick_robot()
@@ -2450,7 +2665,7 @@ async def flow_teach_waypoint_overwrite(body: FlowWpDelBody):
 
 
 @app.post("/api/flow/teach/waypoint/move")
-async def flow_teach_waypoint_move(body: FlowWpMoveBody):
+def flow_teach_waypoint_move(body: FlowWpMoveBody):
     """第 index 个路点与相邻路点交换位置(offset=-1/+1)。"""
     _flow_guard_moving()
     try:
@@ -2462,7 +2677,7 @@ async def flow_teach_waypoint_move(body: FlowWpMoveBody):
 
 
 @app.post("/api/flow/teach/center_mark")
-async def flow_teach_center_mark(body: FlowCenterMarkBody):
+def flow_teach_center_mark(body: FlowCenterMarkBody):
     """设置/取消路点的"中点"标记(双臂中心互斥按路点细化,不动臂)。"""
     _flow_guard_moving()
     try:
@@ -2475,7 +2690,7 @@ async def flow_teach_center_mark(body: FlowCenterMarkBody):
 
 
 @app.post("/api/flow/teach/waypoint/wait")
-async def flow_teach_waypoint_wait(body: FlowWpWaitBody):
+def flow_teach_waypoint_wait(body: FlowWpWaitBody):
     """设置/取消路点的"到点等待"(回放到该点后停留 N 秒,不动臂)。"""
     _flow_guard_moving()
     try:
@@ -2487,7 +2702,7 @@ async def flow_teach_waypoint_wait(body: FlowWpWaitBody):
 
 
 @app.post("/api/flow/teach/clear")
-async def flow_teach_clear(body: FlowArmActionBody):
+def flow_teach_clear(body: FlowArmActionBody):
     try:
         flow_store.clear_action(_flow_arm(body.arm), body.action)
     except ValueError as e:
@@ -2496,7 +2711,7 @@ async def flow_teach_clear(body: FlowArmActionBody):
 
 
 @app.post("/api/flow/action/vacuum")
-async def flow_action_vacuum(body: FlowVacBody):
+def flow_action_vacuum(body: FlowVacBody):
     try:
         a = flow_store.set_action_vacuum(_flow_arm(body.arm), body.action,
                                          body.event, body.at)
@@ -2506,7 +2721,7 @@ async def flow_action_vacuum(body: FlowVacBody):
 
 
 @app.post("/api/flow/action/title")
-async def flow_action_title(body: FlowTitleBody):
+def flow_action_title(body: FlowTitleBody):
     """改动作槽位的步骤说明(A几/B几 后面那行提示)。"""
     try:
         t = flow_store.set_action_title(_flow_arm(body.arm), body.action,
@@ -2517,7 +2732,7 @@ async def flow_action_title(body: FlowTitleBody):
 
 
 @app.post("/api/flow/action/play")
-async def flow_action_play(body: FlowArmActionBody):
+def flow_action_play(body: FlowArmActionBody):
     """单动作试跑(回放该动作全部路点,含真空触发)。"""
     global _TEST_PLAY
     robot = _pick_robot()
@@ -2536,8 +2751,8 @@ async def flow_action_play(body: FlowArmActionBody):
             flow_store._action(runner.cfg, arm, body.action)   # 槽位校验
         except ValueError as e:
             raise _err(str(e), 400)
-        if not runner.cfg["arms"][arm]["actions"][body.action]["waypoints"]:
-            raise _err(f"{body.action} 没有路点", 400)
+        # 空动作不再拒:run_once 会提示"无路点,跳过"后正常结束
+        # (与流水线循环同语义,2026-11-09)
         th = threading.Thread(target=loop.run_once,
                               args=(body.action,), daemon=True,
                               name=f"flow-test-{arm}")
@@ -2547,7 +2762,7 @@ async def flow_action_play(body: FlowArmActionBody):
 
 
 @app.post("/api/flow/action/play/stop")
-async def flow_action_play_stop():
+def flow_action_play_stop():
     r = _TEST_PLAY.get("runner")
     if r is None:
         return {"ok": True, "note": "无试跑任务"}
@@ -2556,7 +2771,7 @@ async def flow_action_play_stop():
 
 
 @app.get("/api/flow/action/play/status")
-async def flow_action_play_status():
+def flow_action_play_status():
     loop = _TEST_PLAY.get("loop")
     th = _TEST_PLAY.get("thread")
     if loop is None:
@@ -2679,23 +2894,23 @@ async def flow_stop():
 
 
 @app.post("/api/flow/step/confirm")
-async def flow_step_confirm():
+def flow_step_confirm():
     return _FLOW.confirm_step()
 
 
 @app.get("/api/flow/status")
-async def flow_status():
+def flow_status():
     return _FLOW.status()
 
 
 @app.get("/api/flow/logs")
-async def flow_logs_list():
+def flow_logs_list():
     """流水线运行日志册清单(新→旧): 起止时间/循环数/参与臂。"""
     return {"runs": flow_runlog.list_runs()}
 
 
 @app.get("/api/flow/logs/preview")
-async def flow_logs_preview(start: str = "", end: str = ""):
+def flow_logs_preview(start: str = "", end: str = ""):
     """客户视图运行报告(按时间段聚合,默认当天): 轮次列表 + A/B 大步
     起止耗时 + 汇总(总轮数/总时间/平均每轮)。流水线在跑时末轮可显示
     为进行中。start/end 支持 YYYY-MM-DD 或 YYYY-MM-DD HH:MM[:SS]。"""
@@ -2707,7 +2922,7 @@ async def flow_logs_preview(start: str = "", end: str = ""):
 
 
 @app.get("/api/flow/logs/export")
-async def flow_logs_export(start: str = "", end: str = ""):
+def flow_logs_export(start: str = "", end: str = ""):
     """运行报告导出 CSV(与预览同口径: 时间段聚合 A/B 大步 + 每轮小计 +
     总计;UTF-8 BOM,Excel 直开)。start/end 参数同 preview。"""
     try:
@@ -2732,7 +2947,7 @@ def _flow_running() -> bool:
 # IK 规划可用性探测
 # ===========================================================================
 @app.get("/api/ik/availability")
-async def ik_availability():
+def ik_availability():
     """ik_helper 进程是否可用:只看能不能起得来 + 能不能返回合法 JSON,
     不依赖具体规划结果(规划可能因关节限位等失败但系统是好的)。"""
     if not Path(SYS_PYTHON).is_file():
@@ -2783,6 +2998,6 @@ if _STATIC.is_dir():
     app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
 
     @app.get("/")
-    async def index():
+    def index():
         return FileResponse(str(_STATIC / "index.html"),
                             headers={"Cache-Control": "no-cache"})

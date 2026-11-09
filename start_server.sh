@@ -60,7 +60,9 @@ start() {
         echo "$(date '+%F %T') supervisor started, port $PORT"
         while true; do
             log_rotate
-            $PY -m uvicorn app:app --host "$HOST" --port "$PORT" >> "$LOG" 2>&1
+            # faulthandler:事件循环再被卡死时 kill -ABRT <uvicorn_pid> 可导出
+            # 全线程 Python 栈到 stderr(即 webapp.log),定位卡点用
+            PYTHONFAULTHANDLER=1 $PY -m uvicorn app:app --host "$HOST" --port "$PORT" >> "$LOG" 2>&1
             rc=$?
             echo "$(date '+%F %T') uvicorn exited rc=$rc, 3s 后重启" >> "$LOG"
             sleep 3

@@ -407,6 +407,11 @@
           <button id="pkScan" class="primary">🔍 扫描(回放扫描位)</button>
           <label><input type="checkbox" id="pkScanNoReplay" /> 不回放(就在当前视角扫)</label>
         </div>
+        <div class="row">
+          <button id="pkTeachHover">📌 存当前为悬停位(袋上方)</button>
+          <button id="pkHoverClear">🗑 清除悬停位</button>
+          <span class="muted" id="pkHoverInfo">已设时: 扫描→关节回放悬停位→小行程下探(料仓在工作空间边缘、扫描位直下会跳解时用)</span>
+        </div>
         <div id="pkScanInfo" class="muted" style="margin-bottom:6px;">先手动把臂移到货架全景视角,存扫描位;之后扫描会自动回到该视角。</div>
         <table class="pttab" id="pkBagTable" style="display:none;">
           <thead><tr><th>#</th><th>层</th><th>正/反</th><th>conf</th><th>z(mm)</th><th>袋心基座(x,y,z mm)</th><th>动作</th></tr></thead>
@@ -469,6 +474,19 @@
 
     <!-- ============== 双臂流水线 ============== -->
     <section id="tab-flow" class="panel">
+      <div class="card">
+        <h3>流水线方案</h3>
+        <div class="row">
+          <select id="flFlowSel" style="min-width:220px;"></select>
+          <button id="flFlowNew" class="primary">＋新建(复制当前)</button>
+          <button id="flFlowNewBlank">＋空白新建</button>
+          <button id="flFlowDel">🗑 删除</button>
+        </div>
+        <p class="muted">每套方案<b>独立保存</b>全部路点/参数/对准参考/真空配置,
+          互不影响;下拉切换即载入(运行中锁定)。新建默认<b>整案克隆当前方案</b>
+          (改名后随便改,原方案不动);「空白新建」只要默认参数骨架。
+          运行日志会记录当时用的方案名。</p>
+      </div>
       <div class="card">
         <h3>使用步骤(第一次跑通按这个顺序)</h3>
         <ol class="muted" style="margin:6px 0 2px 18px;line-height:1.9;">
@@ -638,12 +656,12 @@
         <h3>运行</h3>
         <div class="row">
           <span id="flFixture" class="badge off">中间件:?</span>
-          <label title="留空/0=连续不停;N=每臂跑满 N 个循环后整线自动停(右臂会把第 N 件送完料仓才停)">轮次
+          <label title="留空/0=连续不停;N=每臂跑满 N 个循环后整线自动停(右臂会把第 N 件送完料仓才停)。单臂测试同样生效:填 N=该臂跑 N 循环,留空=1 循环">轮次
             <input id="flRounds" type="number" min="0" max="999" step="1" placeholder="连续" size="3" /></label>
           <label><input type="checkbox" id="flStepMode" /> 单步确认模式(每个动作前暂停等确认)</label>
           <button id="flStart" class="primary">▶ 启动流水线</button>
-          <button id="flStartL" title="只跑左臂: 扫描吸取 → 放中间件,1 个循环自动停,不等右臂">▶ 左臂测试</button>
-          <button id="flStartR" title="只跑右臂: 取中间件 → 放料仓,1 个循环自动停,不等左臂(需中间件有料)">▶ 右臂测试</button>
+          <button id="flStartL" title="只跑左臂: 扫描吸取 → 放中间件,轮次填 N=跑 N 循环(留空=1),不等右臂">▶ 左臂测试</button>
+          <button id="flStartR" title="只跑右臂: 取中间件 → 放料仓,轮次填 N=跑 N 循环(留空=1),不等左臂(需中间件有料;多轮时每轮之间需人工补料)">▶ 右臂测试</button>
           <button id="flStop" class="danger">⏹ 停止(段间)</button>
           <button id="flStepOk">⏭ 确认本步</button>
         </div>
@@ -847,6 +865,6 @@
   </main>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20261105-cartik"></script>
 </body>
 </html>

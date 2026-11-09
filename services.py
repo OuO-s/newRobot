@@ -21,29 +21,65 @@ _PLACEHOLDER_LOCK = threading.Lock()
 _PLACEHOLDER_CACHE: dict = {}      # (cam, reason) -> (ts, jpeg)
 
 
+_CJK_FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+)
+
+
+def _placeholder_fonts():
+    """占位帧字体:优先真 CJK TTF。本机 PIL 9.0.1 的 load_default() 是位图
+    字体——textlength 会 AttributeError、中文还报 latin-1 编码错,2026-11-03
+    预览线程(Cam-left/Cam-right)就是这么整条死的,相机恢复后页面也黑屏。
+    彻底没有 CJK 字体时退 ASCII 文案。返回 (大字号, 小字号, 是否支持中文)。"""
+    from PIL import ImageFont
+    for path in _CJK_FONT_CANDIDATES:
+        try:
+            return (ImageFont.truetype(path, 30),
+                    ImageFont.truetype(path, 18), True)
+        except Exception:                               # noqa: BLE001
+            continue
+    try:
+        return (ImageFont.load_default(size=30),
+                ImageFont.load_default(size=18), False)
+    except TypeError:                                   # 旧 Pillow 无 size 参数
+        return (ImageFont.load_default(),
+                ImageFont.load_default(), False)
+
+
 def _no_signal_jpeg(cam: str, reason: str) -> bytes:
-    """深灰底占位帧:桥接无帧时明确显示"无信号",绝不显示拉伸畸变帧。"""
+    """深灰底占位帧:桥接无帧时明确显示"无信号",绝不显示拉伸畸变帧。
+    任何绘制异常都不能抛出去——它跑在预览线程里,炸了整路预览就没了。"""
     key = (cam, reason)
     with _PLACEHOLDER_LOCK:
         hit = _PLACEHOLDER_CACHE.get(key)
         if hit and time.time() - hit[0] < 5.0:
             return hit[1]
     from io import BytesIO
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
     img = Image.new("RGB", (640, 480), (28, 30, 34))
     d = ImageDraw.Draw(img)
-    try:
-        font = ImageFont.load_default(size=30)
-        small = ImageFont.load_default(size=18)
-    except TypeError:                                   # 旧 Pillow 无 size 参数
-        font = small = ImageFont.load_default()
-    lines = [("无信号", font, (200, 204, 210)), (cam, font, (158, 162, 168)),
-             (reason, small, (158, 162, 168)),
-             (time.strftime("%H:%M:%S"), small, (110, 114, 120))]
+    font, small, cjk = _placeholder_fonts()
+    if cjk:
+        lines = [("无信号", font, (200, 204, 210)),
+                 (cam, font, (158, 162, 168)),
+                 (reason, small, (158, 162, 168)),
+                 (time.strftime("%H:%M:%S"), small, (110, 114, 120))]
+    else:                                               # 位图字体只认 latin-1
+        lines = [("NO SIGNAL", font, (200, 204, 210)),
+                 (cam, font, (158, 162, 168)),
+                 ("bridge no frame, auto recovery", small, (158, 162, 168)),
+                 (time.strftime("%H:%M:%S"), small, (110, 114, 120))]
     y = 480 / 2 - 80
     for text, f, fill in lines:
-        w = d.textlength(text, font=f)
-        d.text(((640 - w) / 2, y), text, fill=fill, font=f)
+        try:
+            w = d.textbbox((0, 0), text, font=f)[2]
+        except Exception:                               # noqa: BLE001 测不了就估宽
+            w = 8 * len(text)
+        try:
+            d.text(((640 - w) / 2, y), text, fill=fill, font=f)
+        except Exception:                               # noqa: BLE001 单行画不上就跳过
+            pass
         y += 46 if f is font else 32
     buf = BytesIO()
     img.save(buf, "JPEG", quality=80)

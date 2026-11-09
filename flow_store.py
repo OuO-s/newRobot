@@ -25,7 +25,16 @@ import numpy as np
 import yaml
 
 FLOW_DIR = Path(__file__).resolve().parent / "flow_data"
-CONFIG_PATH = FLOW_DIR / "flow_config.json"
+# ── 多流水线方案(2026-11-09) ─────────────────────────────────────────
+# 每套方案一个文件 flow_data/flows/<名称>.json(参数/路点/对准参考整套
+# 独立,互不影响);flow_active.json 记当前激活方案。旧单文件
+# flow_config.json 首次访问时原样播种为「流水线1」(此后不再写它,
+# 留作快照)。load_config/save_config 一律读写激活方案,引擎/示教/
+# 试跑端点全部自动跟随。
+LEGACY_CONFIG_PATH = FLOW_DIR / "flow_config.json"
+FLOWS_DIR = FLOW_DIR / "flows"
+ACTIVE_MARK_PATH = FLOW_DIR / "flow_active.json"
+DEFAULT_FLOW_NAME = "流水线1"
 # 左臂手眼直接复用一步到位模块的标定文件;右臂是独立文件(待标定)
 HANDEYE_PATHS = {
     "armleft": FLOW_DIR.parent / "pick_data" / "handeye_result_tianlian_left.yaml",
@@ -53,6 +62,11 @@ ACTIONS_META = {
                         "wait": None, "center": False},
         "B4_place":    {"title": "B4 放料仓: 下降放料 → 放开真空 → 收回",
                         "wait": None, "center": False},
+        # B5 附加动作(可选): B4 后、循环末前执行,空路点=整段跳过。
+        # 用途不限定(退出行程/二次压合/返回预备位…),路点怎么示教就怎么走。
+        "B5_extra":    {"title": "B5 附加动作(可选): B4 放料后执行,空=跳过"
+                                   "(退出/压合/返回等,按示教路点回放)",
+                        "wait": None, "center": False},
     },
 }
 
@@ -72,7 +86,8 @@ POST_GRIP_SLOTS = {
         "B1_approach": "B1 后·对准前",
         "B2_pick":     "B2 后·B3 前",
         "B3_transfer": "B3 后·对准(料仓)前",
-        "B4_place":    "B4 后·循环末",
+        "B4_place":    "B4 后(放料完)",
+        "B5_extra":    "B5 后·循环末",
     },
 }
 
@@ -182,11 +197,120 @@ def _fill_actions(cfg: dict) -> dict:
     return cfg
 
 
+def _sanitize_flow_name(name: str) -> str:
+    """方案名 → 文件名安全的字符串(中文/字母/数字/_-()# 空格,≤24字)。"""
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("方案名不能为空")
+    if len(name) > 24:
+        raise ValueError("方案名过长(≤24 字)")
+    bad = set('\\/:*?"<>|') | set("\t\r\n\x00")
+    if set(name) & bad:
+        raise ValueError('方案名不能包含 \\ / : * ? " < > | 等字符')
+    if name.startswith("."):
+        raise ValueError("方案名不能以 . 开头")
+    return name
+
+
+def _ensure_seeded() -> None:
+    """首次访问:把旧 flow_config.json(或默认骨架)播种成「流水线1」。"""
+    FLOWS_DIR.mkdir(parents=True, exist_ok=True)
+    first = FLOWS_DIR / f"{DEFAULT_FLOW_NAME}.json"
+    if not any(FLOWS_DIR.glob("*.json")):
+        if LEGACY_CONFIG_PATH.is_file():
+            first.write_text(LEGACY_CONFIG_PATH.read_text(encoding="utf-8"),
+                             encoding="utf-8")
+        else:
+            first.write_text(json.dumps(DEFAULTS, ensure_ascii=False,
+                                        indent=2), encoding="utf-8")
+
+
+def list_flows() -> list:
+    """全部方案 [{name, saved_at, mtime}],按修改时间新→旧。"""
+    _ensure_seeded()
+    out = []
+    for p in sorted(FLOWS_DIR.glob("*.json")):
+        try:
+            mtime = p.stat().st_mtime
+            out.append({"name": p.stem, "mtime": mtime,
+                        "saved_at": time.strftime("%m-%d %H:%M",
+                                                  time.localtime(mtime))})
+        except OSError:
+            continue
+    out.sort(key=lambda x: -x["mtime"])
+    return out
+
+
+def active_flow() -> str:
+    """当前激活方案名(指针缺失/指向不存在的方案时回落「流水线1」)。"""
+    _ensure_seeded()
+    if ACTIVE_MARK_PATH.is_file():
+        try:
+            name = json.loads(ACTIVE_MARK_PATH.read_text(
+                encoding="utf-8")).get("name", "")
+            if name and (FLOWS_DIR / f"{name}.json").is_file():
+                return name
+        except Exception:                                # noqa: BLE001
+            pass
+    return DEFAULT_FLOW_NAME
+
+
+def active_path() -> Path:
+    return FLOWS_DIR / f"{active_flow()}.json"
+
+
+def set_active_flow(name: str) -> None:
+    name = _sanitize_flow_name(name)
+    _ensure_seeded()
+    if not (FLOWS_DIR / f"{name}.json").is_file():
+        raise ValueError(f"方案「{name}」不存在")
+    ACTIVE_MARK_PATH.write_text(json.dumps({"name": name},
+                                           ensure_ascii=False),
+                                encoding="utf-8")
+
+
+def create_flow(name: str, copy_from: str | None = None) -> str:
+    """新建方案:copy_from=源方案名(默认=当前激活,整案克隆后可改);
+    传空串 = 空白骨架(只有默认参数,路点/参考全空)。返回规范化名。"""
+    name = _sanitize_flow_name(name)
+    _ensure_seeded()
+    dst = FLOWS_DIR / f"{name}.json"
+    if dst.is_file():
+        raise ValueError(f"方案「{name}」已存在")
+    if copy_from:
+        src = FLOWS_DIR / f"{_sanitize_flow_name(copy_from)}.json"
+        if not src.is_file():
+            raise ValueError(f"源方案「{copy_from}」不存在")
+        cfg = json.loads(json.dumps(json.loads(src.read_text(
+            encoding="utf-8"))))                      # 读到什么克隆什么
+    else:
+        cfg = json.loads(json.dumps(DEFAULTS))         # 空白骨架
+    dst.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    return name
+
+
+def delete_flow(name: str) -> None:
+    """删除方案;激活方案与最后一个方案不可删(防误删整库)。"""
+    name = _sanitize_flow_name(name)
+    _ensure_seeded()
+    if name == active_flow():
+        raise ValueError("当前激活方案不能删除(先切换到别的方案)")
+    flows = list_flows()
+    if len(flows) <= 1:
+        raise ValueError("至少保留一个方案")
+    p = FLOWS_DIR / f"{name}.json"
+    if not p.is_file():
+        raise ValueError(f"方案「{name}」不存在")
+    p.unlink()
+
+
 def load_config() -> dict:
     cfg = json.loads(json.dumps(DEFAULTS))       # 深拷贝默认
-    if CONFIG_PATH.is_file():
+    path = active_path()
+    if path.is_file():
         try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 cfg = _deep_merge(cfg, data)
         except Exception:                              # noqa: BLE001
@@ -217,11 +341,13 @@ def _migrate_b23(cfg: dict) -> dict:
 
 def save_config(cfg: dict) -> None:
     FLOW_DIR.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(FLOW_DIR), suffix=".tmp")
+    FLOWS_DIR.mkdir(parents=True, exist_ok=True)
+    # 原子写激活方案文件(与方案文件同目录,os.replace 不跨文件系统)
+    fd, tmp = tempfile.mkstemp(dir=str(FLOWS_DIR), suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, CONFIG_PATH)
+        os.replace(tmp, active_path())
     except Exception:                                   # noqa: BLE001
         try:
             os.unlink(tmp)
@@ -513,25 +639,45 @@ def readiness(cfg: dict | None = None, only: str | None = None) -> dict:
     if want_l:
         for name in ("A1_transfer", "A2_place"):
             if not la["actions"][name]["waypoints"]:
-                missing.append(f"左臂 {name} 无路点")
+                warnings.append(f"左臂 {name} 无路点: 循环将跳过该段"
+                                "(段后对准也一并跳过)")
     if want_r:
         for name in ("B1_approach", "B2_pick", "B3_transfer", "B4_place"):
             if not ra["actions"][name]["waypoints"]:
-                missing.append(f"右臂 {name} 无路点")
+                warnings.append(f"右臂 {name} 无路点: 循环将跳过该段"
+                                "(段后对准也一并跳过)")
     gate_on = cfg["gate"]["mode"] != "off"
-    for arm, slot, which, where in (
-            ("armleft", la, "align", "中间件"),
-            ("armright", ra, "align", "中间件"),
-            ("armright", ra, "align2", "料仓")):
+    # 观察位动作(闸门在其末点测码): 重示教后 ref.p_cam 视差基准过期
+    # (闸门专项文档 §11.3 纪律) —— 提前拦住,免得闸门追幻影偏移
+    for arm, slot, which, where, obs in (
+            ("armleft", la, "align", "中间件", "A1_transfer"),
+            ("armright", ra, "align", "中间件", "B1_approach"),
+            ("armright", ra, "align2", "料仓", "B3_transfer")):
         if arm == "armleft" and not want_l:
             continue
         if arm == "armright" and not want_r:
             continue
         if not slot.get(which):
             continue
+        # 观察位动作为空 → 运行时该站闸门随动作一并跳过(无观察位,
+        # 测出的 Δ 是幻影),参考/手眼/码配置自然不再作前置项
+        if not slot["actions"][obs]["waypoints"]:
+            continue
         if gate_on and slot[which].get("enabled", True):
             if not slot[which].get("ref"):
                 missing.append(f"{arm} {where}对准参考未记录")
+            else:
+                ref = slot[which]["ref"]
+                obs_wps = slot["actions"][obs]["waypoints"]
+                # 时间串同格式("YYYY-MM-DD HH:MM:SS"),字典序即时间序
+                obs_t = ((obs_wps[-1].get("updated")
+                          or obs_wps[-1].get("created"))
+                         if obs_wps else None)
+                if obs_t and ref.get("created") and ref["created"] < obs_t:
+                    warnings.append(
+                        f"{arm} {where}参考(录于 {ref['created']})早于观察位 "
+                        f"{obs} 末点更新({obs_t}): p_cam 视差基准已过期,"
+                        "先重录该站参考再启动(⚡回观察位并测应 Δ≈0)")
             if not HANDEYE_PATHS[arm].is_file():
                 missing.append(f"{arm} 手眼标定缺失"
                                + ("(右臂待标定,见页内说明)" if arm == "armright"
@@ -549,6 +695,8 @@ def readiness(cfg: dict | None = None, only: str | None = None) -> dict:
         if (arm == "armleft" and not want_l) or \
                 (arm == "armright" and not want_r):
             continue
+        if not cfg["arms"][arm]["actions"][name]["waypoints"]:
+            continue                     # 动作空=跳过,真空触发随之不生效
         vac = cfg["arms"][arm]["actions"][name].get("vacuum")
         if not vac:
             warnings.append(f"{arm} {name} 未配置真空触发({ '吸取' if want == 'grab' else '释放'}"

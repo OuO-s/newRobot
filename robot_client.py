@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import os
 import time
 
 import requests
@@ -17,9 +18,59 @@ import requests
 DEFAULT_TIMEOUT = 3.0        # 查询类请求超时(秒)
 MOTION_TIMEOUT = 8.0         # 非阻塞运动指令超时(秒)
 
+# camera_bridge 运动代理(2026-11-05):DDS 风暴期 :8000(Python rclpy)
+# 单动作 5 次 DDS 往返可膨胀到 30s+,桥内直发 follow action 绕开;
+# 不可达自动回落 :8000。goal 已发出的一律不回落(防双发)。
+BRIDGE_URL = os.environ.get("TL_BRIDGE_URL", "http://127.0.0.1:7101")
+
 
 class RobotError(Exception):
     """机器人接口业务失败或通信失败。"""
+
+
+class BridgeDown(Exception):
+    """运动代理不可达/未就绪(调用方回落 :8000)。"""
+
+
+def _bridge_post(path: str, body: dict, read_timeout: float) -> dict:
+    """POST 到桥的运动代理。连接层失败抛 BridgeDown(可安全回落);
+    读超时抛 RobotError —— 请求可能已达且动作在执行,回落=双发,禁止。"""
+    try:
+        r = requests.post(BRIDGE_URL + path, json=body or {},
+                          timeout=(1.5, read_timeout))
+    except (requests.ConnectTimeout, requests.ConnectionError) as e:
+        raise BridgeDown() from e
+    except requests.ReadTimeout as e:
+        raise RobotError("运动代理响应超时——动作可能仍在执行,已禁止自动"
+                         "重发;如异常请用手动停止") from e
+    except requests.RequestException as e:
+        raise BridgeDown() from e
+    if r.status_code == 503:
+        raise BridgeDown()            # 代理组件缺失(fd_arm_api 不可用)
+    if r.status_code != 200:
+        try:
+            data = r.json()
+        except Exception:                                 # noqa: BLE001
+            data = {}
+        raise RobotError(f"运动代理 {path}: HTTP {r.status_code} "
+                         f"{data.get('error') or data.get('message') or ''}")
+    data = r.json()
+    return data if isinstance(data, dict) else {}
+
+
+def joints_from_bridge(arm: str, max_age_ms: int = 250) -> list[float] | None:
+    """从桥的 /joint_states(100Hz)订阅缓存读关节角(度);不可用/过旧→None。"""
+    try:
+        r = requests.get(f"{BRIDGE_URL}/joints", timeout=(1.0, 1.0))
+        d = r.json() if r.status_code == 200 else {}
+    except Exception:                                     # noqa: BLE001
+        return None
+    if not d.get("ok") or d.get("age_ms", 1 << 30) > max_age_ms:
+        return None
+    deg = d.get("left_deg" if arm == "armleft" else "right_deg")
+    if isinstance(deg, list) and len(deg) >= 7:
+        return [float(v) for v in deg[:7]]
+    return None
 
 
 _IMAGE_MAGICS = (b"\x89PNG", b"\xff\xd8\xff", b"GIF8", b"BM",
@@ -43,6 +94,9 @@ class TianlianRobot:
         self.web_port = web_port
         self.arm_port = arm_port
         self.session = requests.Session()
+        # app 启动时注入 (arm)->{"position","orientation"}|None 的 FK 快读钩子
+        # (见 cartesian.EndPoseFK);未注入时 get_end_poses 走 :8000 原路。
+        self._end_pose_hook = None
 
     # ------------------------------------------------------------------ 基础
     def _url(self, port: int, path: str) -> str:
@@ -243,7 +297,35 @@ class TianlianRobot:
         }
 
     def get_end_poses(self) -> dict:
-        """返回 {armleft: {"position":[x,y,z],"orientation":[x,y,z,w]}, ...}。"""
+        """返回 {armleft: {"position":[x,y,z],"orientation":[x,y,z,w]}, ...}。
+
+        优先走 FK 快读钩子(桥缓存关节角 + 标定过的安装偏移,毫秒级,
+        风暴期不吃 get_end_pose 的 0.6~3s 服务往返);钩子没标定好/失效
+        自动回落 :8000。"""
+        if self._end_pose_hook is not None:
+            try:
+                out = {}
+                for arm in ("armleft", "armright"):
+                    p = self._end_pose_hook(arm)
+                    if p and p.get("position") and p.get("orientation"):
+                        out[arm] = {"position": list(p["position"]),
+                                    "orientation": list(p["orientation"])}
+                if out:
+                    if len(out) == 2:
+                        return out
+                    # 只出一侧=另一侧偏移未标定,该侧补读(静止时副作用小)
+                    payload = self._get(self.arm_port, "/get_end_pose",
+                                        timeout=5.0)
+                    for arm in ("armleft", "armright"):
+                        if arm not in out:
+                            p = (payload.get(f"{arm}_end_pose") or {})
+                            if p.get("position"):
+                                out[arm] = p
+                    return out
+            except RobotError:
+                raise
+            except Exception:                             # noqa: BLE001
+                pass        # 钩子异常不致命,回落原路
         payload = self._get(self.arm_port, "/get_end_pose")
         if not payload.get("success"):
             raise RobotError(_text_of(payload) or "机械臂未初始化或未接收到数据")
@@ -251,6 +333,26 @@ class TianlianRobot:
             "armleft": payload.get("armleft_end_pose") or {},
             "armright": payload.get("armright_end_pose") or {},
         }
+
+    def get_end_poses_raw(self, arm: str) -> dict | None:
+        """:8000 原始末端位姿直读(绕过钩子;EndPoseFK 标定偏移用)。"""
+        payload = self._get(self.arm_port, "/get_end_pose", timeout=5.0)
+        if not payload.get("success"):
+            return None
+        p = payload.get(f"{arm}_end_pose") or {}
+        pos, quat = p.get("position"), p.get("orientation")
+        if not pos or not quat:
+            return None
+        return {"position": [float(v) for v in pos],
+                "orientation": [float(v) for v in quat]}
+
+    def get_joint_angles_fast(self, arm: str, max_age_ms: int = 250) -> list:
+        """读关节角(度):桥缓存优先(≤max_age_ms,毫秒级),干涸回落 :8000。"""
+        got = joints_from_bridge(arm, max_age_ms)
+        if got:
+            return got
+        data = self.get_joint_angles()
+        return list((data or {}).get(arm) or [])
 
     def get_manipulator_states(self) -> dict:
         """末端执行器状态:{left:{type,open|joints}, right:{...}}。"""
@@ -277,7 +379,27 @@ class TianlianRobot:
     def move_robotarm_traj(self, robot_name: str, trajectory_deg: list[list[float]],
                            block: int = 1, timeout: float = 30.0,
                            speed: int = 15) -> dict:
-        """关节空间轨迹运动。trajectory 每点为 N 个关节角(度)。"""
+        """关节空间轨迹运动。trajectory 每点为 N 个关节角(度)。
+
+        快路径(2026-11-05):经桥运动代理直发 follow action(插值在桥内
+        用厂商库完成,起点取 /joint_states 缓存),绕开 :8000 的 5 次 DDS
+        往返;代理不可达自动回落。goal 已发出(stage=result)绝不回落。"""
+        if block:
+            try:
+                r = _bridge_post("/arm/move_traj", {
+                    "arm": robot_name,
+                    "trajectory_deg": [[float(v) for v in pt]
+                                       for pt in trajectory_deg],
+                    "speed": int(speed), "timeout": float(timeout), "block": 1,
+                }, read_timeout=float(timeout) * 2.0 + 30.0)
+                if r.get("stage") == "result":
+                    if not r.get("ok"):
+                        raise RobotError(f"跟随轨迹失败: "
+                                         f"{r.get('message') or r.get('error') or '未知'}")
+                    return {"success": True, "src": "bridge",
+                            "message": r.get("message") or "ok"}
+            except BridgeDown:
+                pass                    # 代理不在/没就绪 → :8000 原路
         return self._post_arm("/move_robotarm", {
             "robot_name": robot_name, "trajectory": trajectory_deg,
             "unit": "deg", "block": block, "timeout": timeout, "speed": speed,
@@ -311,6 +433,22 @@ class TianlianRobot:
     def move_to_location(self, robot_name: str, location_name: str,
                          timeout: float = 60.0, speed: int = 15,
                          use_joint_motion: bool = False) -> dict:
+        """到预设位姿。快路径:桥直发 ArmMoveToLocation action(与 :8091
+        同一条路);action 已发出(stage=result)绝不回落 :8000 重发。"""
+        try:
+            r = _bridge_post("/arm/move_location", {
+                "arm": robot_name, "location": location_name,
+                "timeout": float(timeout), "speed": int(speed),
+                "use_joint_motion": bool(use_joint_motion),
+            }, read_timeout=float(timeout) * 2.0 + 30.0)
+            if r.get("stage") == "result":
+                if not r.get("ok"):
+                    raise RobotError(f"预设位姿移动失败: "
+                                     f"{r.get('message') or r.get('error') or '未知'}")
+                return {"success": True, "src": "bridge",
+                        "message": r.get("message") or "ok"}
+        except BridgeDown:
+            pass
         return self._post_arm("/move_to_location", {
             "robot_name": robot_name, "location_name": location_name,
             "block": 1, "timeout": timeout, "speed": speed,

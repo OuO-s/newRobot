@@ -19,7 +19,8 @@
   vacuum               真空抓/放(模式/参数/保持时长)
   handoff              中间件令牌 EMPTY/FILLED 与中心区锁进出
   cycle                单臂一轮完整记录: 起止时间/duration_s/phases 分解/
-                       actions 明细/gates 明细/速度%
+                       actions 明细/gates 明细/速度%(speeds_used=本轮
+                       实际下发过的速度,中途改速多值 [30,50])
   stop/abort/arm_end   收尾与异常
 
 写失败一律吞掉 —— 日志绝不让流水线崩。jsonl 用 default=str 兜住
@@ -35,8 +36,11 @@ numpy 标量等非 JSON 类型。
 
 客户视图运行报告(网页『📈 运行报告』/ GET /api/flow/logs/preview):
   aggregate_report(start,end) 按时间段(默认当天)把全部日志册聚合成
-    轮次 × A/B 大步(起止/耗时,进行中标记)+ 汇总(总轮数/累计/平均);
-  export_report_csv(start,end) 同口径 CSV(中文表头,UTF-8 BOM)。
+    轮次 × A/B 大步(起止/耗时/每轮速度,进行中标记)+ 汇总(总轮数/累计/
+    平均);每轮速度取自该轮 cycle 事件的 speeds_used(实际下发值,中途
+    改速显示 30→50%),进行中轮取末个 cycle 后的动作/运动段速度;
+  export_report_csv(start,end) 同口径 CSV(中文表头,UTF-8 BOM,速度列
+    在每轮小计行,如「A臂 30% / B臂 40%」)。
   纯读现有 jsonl,不新增落盘;明细日志照常写,供内部排查。
 """
 from __future__ import annotations
@@ -210,6 +214,25 @@ def _t_shift(iso_s: str | None, dt_s: float) -> str:
         return ""
 
 
+def _spd_txt(rec: dict | None) -> str:
+    """一条 cycle 记录 → 该轮实际速度文本: '30%' / 中途改速 '30→50%'。
+    speeds_used(本轮各动作实际下发值)优先,旧册无此字段退 speed_pct。"""
+    if not rec:
+        return ""
+    used = rec.get("speeds_used")
+    if used:
+        return "→".join(f"{v:g}%" for v in used)
+    v = rec.get("speed_pct")
+    return f"{v:g}%" if isinstance(v, (int, float)) else ""
+
+
+def _round_speed_txt(speeds: dict[str, str]) -> str:
+    """{armleft: '30%', armright: '40%'} → 'A臂 30% / B臂 40%'(缺臂跳过)。"""
+    parts = [f"{_ARM_LABEL[a]}臂 {s}" for a in ("armleft", "armright")
+             if (s := speeds.get(a))]
+    return " / ".join(parts)
+
+
 def _row(r: dict) -> list:
     """一条事件 → CSV 行(各 kind 的名称/起止/明细见模块头)。"""
     k = r.get("kind")
@@ -244,7 +267,8 @@ def _row(r: dict) -> list:
     elif k == "cycle":
         name = f'循环#{r.get("cycle")}'
         t0, t1 = r.get("t_start"), r.get("t_end")
-        dur, spd = r.get("duration_s"), r.get("speed_pct")
+        dur = r.get("duration_s")
+        spd = _spd_txt(r) or r.get("speed_pct")   # 30 / 30→50(中途改速)
         detail = ";".join(f"{p}={d}s" for p, d in r.get("phases") or [])
         detail += f';近均值={r.get("avg_recent_s")}s'
         if r.get("gates"):
@@ -329,6 +353,7 @@ _ARM_STEPS = {
         ("armright|B3_transfer", ("B3_transfer",)),
         ("$gate_align2", ("gate_align2",)),
         ("armright|B4_place", ("B4_place",)),
+        ("armright|B5_extra", ("B5_extra",)),
     ),
 }
 _ARM_LABEL = {"armleft": "A", "armright": "B"}
@@ -338,13 +363,13 @@ _TITLES_CACHE: tuple[float, dict] = (0.0, {})
 
 
 def _step_labels() -> dict:
-    """步骤键 → 显示名。动作步取 flow_config 当前提示名(按文件 mtime
+    """步骤键 → 显示名。动作步取激活流水线方案当前提示名(按文件 mtime
     缓存);flow_store 不可用时退回动作 id,报表绝不因它报错。"""
     global _TITLES_CACHE
     out = dict(_FIXED_STEP)
     try:
         import flow_store
-        m = flow_store.CONFIG_PATH.stat().st_mtime
+        m = flow_store.active_path().stat().st_mtime
         if _TITLES_CACHE[0] != m:
             cfg = flow_store.load_config()
             _TITLES_CACHE = (m, {
@@ -452,6 +477,7 @@ def _rounds_of_run(events: list[dict]) -> tuple[list[dict], dict | None]:
     的并:A 的第 N 件从取料到入中间件,B 的第 N 件从中间件到入料仓。"""
     cyc: dict[str, dict[int, dict]] = {}
     ph_by_arm: dict[str, list[dict]] = {}
+    spd_by_arm: dict[str, list[tuple]] = {}   # [(ts, speed_pct)] 供进行中轮取速度
     for r in events:
         k, arm = r.get("kind"), r.get("arm")
         if arm not in _ARM_STEPS or "ts" not in r:
@@ -463,6 +489,8 @@ def _rounds_of_run(events: list[dict]) -> tuple[list[dict], dict | None]:
                 continue
         elif k == "phase":
             ph_by_arm.setdefault(arm, []).append(r)
+        elif k in ("action", "move") and r.get("speed_pct") is not None:
+            spd_by_arm.setdefault(arm, []).append((r["ts"], r["speed_pct"]))
     if not cyc:
         return [], None                       # 试跑册(无循环)不进客户视图
     for phs in ph_by_arm.values():
@@ -488,12 +516,14 @@ def _rounds_of_run(events: list[dict]) -> tuple[list[dict], dict | None]:
             phs = [r for r in ph_by_arm.get(arm, [])
                    if ct0.timestamp() - 0.5 <= r["ts"] <= ct1.timestamp() + 0.05]
             steps += _steps_from_phases(phs, arm, ct1.timestamp())
+        speeds = {a: _spd_txt(c) for a, c in recs.items()}
         rounds.append({
             "round": n, "t_start": t0, "t_end": t1,
             "start": datetime.fromtimestamp(t0).strftime("%Y-%m-%d %H:%M:%S"),
             "end": datetime.fromtimestamp(t1).strftime("%Y-%m-%d %H:%M:%S"),
             "duration_s": round(t1 - t0, 1), "ongoing": False,
             "arms": sorted(recs), "steps": steps,
+            "speeds": speeds, "speed_txt": _round_speed_txt(speeds),
             "_cycles": {a: c.get("duration_s") for a, c in recs.items()},
         })
     # 进行中: 最新一册里,某臂最后一条 cycle 之后还有 phase(未收口的循环)。
@@ -515,18 +545,24 @@ def _rounds_of_run(events: list[dict]) -> tuple[list[dict], dict | None]:
             continue
         st = _steps_from_phases(trail, arm, None)
         if st:
-            pend[arm] = (last + 1, st)
+            # 进行中轮的速度: 末个 cycle 之后该臂实际下发过的动作/运动速度
+            used = sorted({v for t, v in spd_by_arm.get(arm, [])
+                           if cut is None or t > cut})
+            pend[arm] = (last + 1, st,
+                         "→".join(f"{v:g}%" for v in used))
     pending = None
     if pend:
-        n = min(pn for pn, _ in pend.values())
+        n = min(p[0] for p in pend.values())
         steps = [s for arm in ("armleft", "armright")
                  if arm in pend for s in pend[arm][1]]
         starts = [s["start"] for s in steps if s.get("start")]
         t0 = min(starts) if starts else None
+        speeds = {a: p[2] for a, p in pend.items() if p[2]}
         pending = {
             "round": n, "t_start": None, "start": t0, "end": None,
             "duration_s": None, "ongoing": True,
             "arms": sorted(pend), "steps": steps,
+            "speeds": speeds, "speed_txt": _round_speed_txt(speeds),
         }
     return rounds, pending
 
@@ -597,16 +633,19 @@ def export_report_csv(start: str = "", end: str = "",
     rep = aggregate_report(start, end, active=active)
     buf = io.StringIO()
     w = csv.writer(buf, lineterminator="\n")
-    w.writerow(["次", "轮次", "臂", "大步", "开始时间", "结束时间", "耗时(秒)"])
+    w.writerow(["次", "轮次", "臂", "大步", "开始时间", "结束时间",
+                "耗时(秒)", "速度"])
     for r in rep["rounds"]:
         for s in r["steps"]:
             w.writerow([f'第{r.get("session", 1)}次', f'第{r["round"]}轮',
                         s["arm_label"] + "臂", s["name"],
                         s["start"], s["end"] or "进行中",
-                        "" if s["duration_s"] is None else s["duration_s"]])
+                        "" if s["duration_s"] is None else s["duration_s"],
+                        ""])
         w.writerow([f'第{r.get("session", 1)}次', f'第{r["round"]}轮',
                     "", "本轮小计", r["start"], r["end"] or "进行中",
-                    "" if r["duration_s"] is None else r["duration_s"]])
+                    "" if r["duration_s"] is None else r["duration_s"],
+                    r.get("speed_txt", "")])
     s = rep["summary"]
     if s["rounds_total"]:
         w.writerow(["总计",

@@ -52,6 +52,12 @@ DEFAULTS: dict = {
     "residual_mm": [0.0, 0.0, 0.0],      # 对准校正全局残差
     "per_bag_residual_mm": {},           # {"1": [dx,dy,dz]} 分袋残差(旧 suct_adj)
     "scan_pose": None,          # {"joints_deg":[..], "end_pose":{..}, "created":}
+    "hover_pose": None,         # 吸取悬停位(袋上方·与吸取同解枝):
+                                # 扫描后先关节回放到此(无 IK 无跳解),再做
+                                # 小行程笛卡尔下探。扫描位求视野/悬停位求
+                                # 几何,料仓在工作空间边缘时二者不可兼得
+                                # (2026-11-09: 扫描位→袋笛卡尔规划解分支
+                                # 翻转 90° 被 45° 护栏拒)
     "align": None,              # {"rpy_deg":[..], "z_ref_m":f, "created":}
 }
 

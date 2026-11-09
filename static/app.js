@@ -45,6 +45,8 @@ const API = {
   pkConfigSet:   (b) => post('/api/pick/config', b),
   pkDepthHealth: () => fetch('/api/pick/depth/health').then(r => r.json()),
   pkTeachScan:   () => post('/api/pick/teach/scan_pose', {}),
+  pkTeachHover:  () => post('/api/pick/teach/hover_pose', {}),
+  pkHoverClear:  () => post('/api/pick/teach/hover_pose?clear=1', {}),
   pkTeachAlign:  (b) => post('/api/pick/teach/align', b),
   pkScan:        (b) => post('/api/pick/scan', b),
   pkStart:       (b) => post('/api/pick/start', b),
@@ -52,6 +54,9 @@ const API = {
   pkStop:        () => post('/api/pick/stop', {}),
   flConfigGet:   () => fetch('/api/flow/config').then(r => r.json()),
   flConfigSet:   (b) => post('/api/flow/config', b),
+  flFlowSwitch:  (name) => post('/api/flow/flows/active', { name }),
+  flFlowCreate:  (name, copyFrom) => post('/api/flow/flows/create', { name, copy_from: copyFrom }),
+  flFlowDel:     (name) => post('/api/flow/flows/delete', { name }),
   flWpAdd:       (arm, action) => post('/api/flow/teach/waypoint', { arm, action }),
   flWpDelLast:   (arm, action, n) => post('/api/flow/teach/waypoint/delete', { arm, action, index: n }),
   flWpOverwrite: (arm, action, index) => post('/api/flow/teach/waypoint/overwrite', { arm, action, index }),
@@ -178,7 +183,7 @@ document.querySelectorAll('.tab').forEach(t => {
     t.classList.add('active');
     document.getElementById('tab-' + t.dataset.tab).classList.add('active');
     if (t.dataset.tab === 'chassis') refreshMap();
-    if (t.dataset.tab === 'cart') { cartRefreshPose(); refreshEffector(); }
+    if (t.dataset.tab === 'cart') { cartRefreshPose(true); refreshEffector(); }
     if (t.dataset.tab === 'cart-teach') ctRefreshCurrent();
   });
 });
@@ -418,21 +423,28 @@ function jogParams() {
 
 function startJog(j, dir, btn) {
   const st = JOBS[j];
-  if (st.timer) return;                 // 已按住,不重复起
+  if (st.timer || st.starting) return;  // 已按住/正在起步,不重复起
   st.dir = dir;
   st.seq = 0;
   btn.classList.add('holding');
   const p = jogParams();
-  // 丢掉后端游标,让本次按住从实时反馈起步(不会接上次按住的目标继续走)
-  API.jogReset(p.arm).catch(() => {});
-  // 立即发第一帧,避免按下到起跳有延迟
-  tickJog(j);
-  st.timer = setInterval(() => tickJog(j), p.period);
+  // 丢掉后端游标,让本次按住从实时反馈起步(不会接上次按住的目标继续走)。
+  // 必须等 reset 生效后再发首拍:后端起步角现在优先走 /joint_states 话题
+  // 缓存(毫秒级),若 reset 尚未落库首拍就到,会拿到上一次按住的旧游标。
+  st.starting = true;
+  API.jogReset(p.arm).catch(() => {}).finally(() => {
+    st.starting = false;
+    if (!st.dir) return;                // 极短按:reset 期间已松手
+    // 先立 timer 再立即发首帧(tickJog 有 !st.timer 守卫,顺序反了首帧
+    // 会被吞掉白等一个周期——原版就是这个 quirk,顺带修掉)
+    st.timer = setInterval(() => tickJog(j), p.period);
+    tickJog(j);
+  });
 }
 
 function stopJog(j, btn) {
   const st = JOBS[j];
-  if (!st.timer) return;
+  if (!st.timer && !st.starting) return;
   clearInterval(st.timer);
   st.timer = null;
   st.dir = 0;
@@ -459,7 +471,12 @@ function tickJog(j) {
     if (cell) cell.textContent = fmt(r.commanded_deg, 2);
     const s = document.getElementById('jogStatus');
     if (r.at_limit) s.textContent = `⚠️ J${j+1} 已达软限位 ±175°,换方向试试`;
-    else s.textContent = `J${j+1} 命令 ${fmt(r.commanded_deg,2)}° / 反馈 ${fmt(r.actual_deg,2)}° (滞后 ${fmt(r.lag_deg,1)}°)`;
+    else {
+      // 反馈来自话题缓存,偶尔缺帧时为 null(非故障):只显示命令角
+      const fb = (r.actual_deg === null || r.actual_deg === undefined)
+        ? '' : ` / 反馈 ${fmt(r.actual_deg,2)}° (滞后 ${fmt(r.lag_deg,1)}°)`;
+      s.textContent = `J${j+1} 命令 ${fmt(r.commanded_deg,2)}°${fb} [${r.src || '?'}]`;
+    }
   }).catch(e => {
     st.inflight = false;
     stopJog(j);                          // 出错立即停,避免一直刷错误
@@ -505,17 +522,25 @@ function syncJogFromStatus() {
 }
 
 // ===== 笛卡尔移动 =====
-async function cartRefreshPose() {
-  const arm = document.getElementById('cartArm').value;
+let _cartPoseBusy = false, _cartPoseLast = 0;
+async function cartRefreshPose(force) {
+  // 读取走 :8000 get_end_pose,DDS 风暴期 0.6~3s;连续点动每拍刷会堆积
+  // 并发慢读,反而挤占同一条链路。默认 800ms 节流 + 单飞,手动刷新强制。
+  const now = Date.now();
+  if (!force && (_cartPoseBusy || now - _cartPoseLast < 800)) return;
+  _cartPoseBusy = true; _cartPoseLast = now;
   try {
+    const arm = document.getElementById('cartArm').value;
     const p = await API.cartCurrent(arm);
     document.getElementById('cartCurrentPose').textContent = fmtPoseMm(p);
   } catch (e) {
     document.getElementById('cartCurrentPose').textContent = '获取失败: ' + e.message;
+  } finally {
+    _cartPoseBusy = false;
   }
 }
-document.getElementById('cartArm').addEventListener('change', cartRefreshPose);
-document.getElementById('cartRefreshPose').addEventListener('click', cartRefreshPose);
+document.getElementById('cartArm').addEventListener('change', () => cartRefreshPose(true));
+document.getElementById('cartRefreshPose').addEventListener('click', () => cartRefreshPose(true));
 
 function cartParams() {
   return {
@@ -592,13 +617,13 @@ async function cartStepOnce(key) {
     try {
       await API.cartRotate({ arm: p.arm, axis, angle_deg: sign * step,
                              frame: p.frame });
-      cartRefreshPose();
+      cartRefreshPose(true);
     } catch (e) { toast('旋转失败: ' + e.message, 'error'); }
   } else {
     try {
       await API.cartJog({ arm: p.arm, axis, distance: sign * p.step_m,
                           frame: p.frame, step_m: p.step_m });
-      cartRefreshPose();
+      cartRefreshPose(true);
     } catch (e) { toast('平移失败: ' + e.message, 'error'); }
   }
 }
@@ -646,7 +671,7 @@ document.getElementById('cartGoto').addEventListener('click', async () => {
   try {
     await API.cartMoveTo({ arm: p.arm, pos, rpy });
     toast('已下发目标位姿', 'success');
-    cartRefreshPose();
+    cartRefreshPose(true);
   } catch (e) { toast('目标移动失败: ' + e.message, 'error'); }
 });
 
@@ -1105,6 +1130,7 @@ async function pkRefreshCfg() {
             al ? `对准:残差(${(c.residual_mm || []).join(',')})mm` : '对准:未校正');
     const he = r.handeye || {};
     pkBadge('pkHandeyeBadge', !!he.ok, he.ok ? `手眼:${he.time || ''}` : '手眼:缺文件');
+    pkHoverShow(c.hover_pose || null);
     if (r.role_warning) {
       document.getElementById('pkScanInfo').textContent = '⚠ ' + r.role_warning;
     }
@@ -1168,6 +1194,32 @@ document.getElementById('pkTeachScan').addEventListener('click', async () => {
     pkRefreshCfg();
   } catch (e) { toast('存扫描位失败: ' + e.message, 'error'); }
 });
+
+document.getElementById('pkTeachHover').addEventListener('click', async () => {
+  if (!confirm('把当前臂位姿存为吸取悬停位?(袋上方·与吸取同解枝;不动臂)')) return;
+  try {
+    const r = await API.pkTeachHover();
+    toast('悬停位已存: ' + r.hover_pose.created, 'success');
+    pkHoverShow(r.hover_pose);
+  } catch (e) { toast('存悬停位失败: ' + e.message, 'error'); }
+});
+
+document.getElementById('pkHoverClear').addEventListener('click', async () => {
+  if (!confirm('清除悬停位?吸取回到"扫描位直接下探"')) return;
+  try {
+    await API.pkHoverClear();
+    toast('悬停位已清除', 'success');
+    pkHoverShow(null);
+  } catch (e) { toast('清除失败: ' + e.message, 'error'); }
+});
+
+function pkHoverShow(hp) {
+  const el = document.getElementById('pkHoverInfo');
+  if (!el) return;
+  el.textContent = hp
+    ? `✓ 悬停位 ${hp.created} 示教;吸取: 扫描→关节回放悬停位→小行程下探`
+    : '未设悬停位;已设时: 扫描→关节回放悬停位→小行程下探';
+}
 
 function pkRenderRows(rows) {
   const tb = document.querySelector('#pkBagTable tbody');
@@ -2127,7 +2179,7 @@ const FL_PHASE_LABEL = {
   pick_press: '③ 下压', pick_grab: '④ 吸取·真空窗口',
   A1_transfer: 'A1 转移', A2_place: 'A2 放中间件',
   B0_pre: 'B0 预备', B1_approach: 'B1 到中间件', B2_pick: 'B2 取料',
-  B3_transfer: 'B3 转移料仓', B4_place: 'B4 放料仓',
+  B3_transfer: 'B3 转移料仓', B4_place: 'B4 放料仓', B5_extra: 'B5 附加',
   gate_align: 'PBVS对准·中间件', gate_align2: 'PBVS对准·料仓',
   wait_empty: '等中间件空', wait_filled: '等中间件有料', wait_center: '等中心区空闲',
   idle: '空闲', aborted: '已软停', failed: '失败',
@@ -2145,6 +2197,14 @@ async function flRefresh() {
 
 function flRender(r) {
   flCfg = r;
+  // 流水线方案下拉(多方案独立保存,切换即载入)
+  if (r.flows) {
+    const sel = document.getElementById('flFlowSel');
+    sel.innerHTML = r.flows.list.map(f =>
+      `<option value="${f.name.replace(/"/g, '&quot;')}"` +
+      `${f.name === r.flows.active ? ' selected' : ''}>` +
+      `${f.name.replace(/</g, '&lt;')}(${f.saved_at})</option>`).join('');
+  }
   const heL = r.handeye.armleft, heR = r.handeye.armright;
   flBadge(document.getElementById('flHeLeft'), heL.ok,
           '左臂手眼:' + (heL.ok ? '已标定' : '缺失'));
@@ -2382,6 +2442,43 @@ document.getElementById('flActsRight')
 
 document.getElementById('flRefresh').addEventListener('click', flRefresh);
 
+// ── 流水线方案(多方案独立保存):切换/新建/删除 ──────────────────
+document.getElementById('flFlowSel').addEventListener('change', async (e) => {
+  const name = e.target.value;
+  if (!flCfg || !flCfg.flows || name === flCfg.flows.active) return;
+  if (!confirm(`切换到方案「${name}」?页面与示教/试跑全部改用该方案`)) {
+    e.target.value = flCfg.flows.active; return;
+  }
+  try {
+    flRender(await API.flFlowSwitch(name));
+    toast(`已切换到「${name}」`, 'ok');
+  } catch (err) { toast(err.message, 'error'); e.target.value = flCfg.flows.active; }
+});
+
+async function flFlowNew(blank) {
+  const def = blank ? '流水线2' : `${flCfg?.flows?.active || '流水线1'}-副本`;
+  const name = prompt(blank ? '新方案名称(空白骨架,只有默认参数):' : `新方案名称(整案克隆「${flCfg?.flows?.active || ''}」):`, def);
+  if (name === null) return;
+  try {
+    const r = blank ? await API.flFlowCreate(name, '') : await API.flFlowCreate(name);
+    flRender(r);
+    toast(`已新建并切换到「${r.flows.active}」`, 'ok');
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+document.getElementById('flFlowNew').addEventListener('click', () => flFlowNew(false));
+document.getElementById('flFlowNewBlank').addEventListener('click', () => flFlowNew(true));
+document.getElementById('flFlowDel').addEventListener('click', async () => {
+  const name = flCfg?.flows?.active;
+  if (!name) return;
+  if (!confirm(`删除方案「${name}」?路点/参数/对准参考一并删除,不可恢复`)) return;
+  try {
+    const r = await API.flFlowDel(name);
+    await flRefresh();
+    toast(`已删除「${name}」,当前「${r.active}」`, 'ok');
+  } catch (err) { toast(err.message, 'error'); }
+});
+
 document.getElementById('flSaveCfg').addEventListener('click', async () => {
   try {
     await API.flConfigSet({
@@ -2560,14 +2657,16 @@ document.getElementById('flStart').addEventListener('click', async () => {
   } catch (e) { toast(e.message, 'error'); }
 });
 for (const [id, arms, label] of [
-  ['flStartL', 'left', '左臂测试已启动(1 循环自动停)'],
-  ['flStartR', 'right', '右臂测试已启动(1 循环自动停)']]) {
+  ['flStartL', 'left', '左臂测试'],
+  ['flStartR', 'right', '右臂测试']]) {
   document.getElementById(id).addEventListener('click', async () => {
     try {
+      const rd = parseInt(document.getElementById('flRounds').value, 10);
+      const n = (Number.isFinite(rd) && rd > 0) ? rd : 1;
       await API.flStart({ step_mode:
                           document.getElementById('flStepMode').checked,
-                          arms });
-      toast(label, 'success');
+                          arms, rounds: n > 1 ? n : null });
+      toast(`${label}已启动(${n} 循环自动停)`, 'success');
       flPoll(true);
     } catch (e) { toast(e.message, 'error'); }
   });
@@ -2601,14 +2700,16 @@ function flRptRender(rep) {
       `<td>${st.arm_label}臂</td>` +
         `<td>${st.name}</td><td>${st.start || '-'}</td>` +
         `<td>${st.end || (st.ongoing ? '进行中' : '-')}</td>` +
-        `<td>${st.ongoing ? '进行中' : flFmtDur(st.duration_s)}</td></tr>`);
+        `<td>${st.ongoing ? '进行中' : flFmtDur(st.duration_s)}</td>` +
+        `<td></td></tr>`);
     }
     rows.push(`<tr class="flrpt-sub"><td>第${r.session}次</td><td>第${r.round}轮</td>` +
       `<td></td>` +
       `<td><b>本轮小计${r.ongoing ? '(进行中)' : ''}</b></td>` +
       `<td>${r.start || '-'}</td>` +
       `<td>${r.end || (r.ongoing ? '进行中' : '-')}</td>` +
-      `<td><b>${r.ongoing ? '-' : flFmtDur(r.duration_s)}</b></td></tr>`);
+      `<td><b>${r.ongoing ? '-' : flFmtDur(r.duration_s)}</b></td>` +
+      `<td><b>${r.speed_txt || '-'}</b></td></tr>`);
   }
   box.className = '';
   box.innerHTML =
@@ -2619,7 +2720,7 @@ function flRptRender(rep) {
     ` | 累计 ${flFmtDur(s.total_s)} | 平均每轮 ${flFmtDur(s.avg_s)}` +
     (s.first_start ? ` | 首轮开始 ${s.first_start}` : '') + '</div>' +
     '<table class="flrpt"><thead><tr><th>次</th><th>轮次</th><th>臂</th><th>大步</th>' +
-    '<th>开始时间</th><th>结束时间</th><th>耗时</th></tr></thead><tbody>' +
+    '<th>开始时间</th><th>结束时间</th><th>耗时</th><th>速度</th></tr></thead><tbody>' +
     rows.join('') + '</tbody></table>';
 }
 { // 默认当天(本地时区,避开 toISOString 的 UTC 偏移)

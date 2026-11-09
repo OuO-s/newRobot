@@ -10,7 +10,7 @@
   右臂循环: (B0 预备) → 等 FILLED → B1 到中间件上方 → 对准闸门 →
             B2 取料(开真空,退出中心后置 EMPTY) → [可选:B2→B3 夹爪整形] →
             B3 转移料仓上方 →
-            对准闸门2 → B4 放入料仓(断真空) → 收回
+            对准闸门2 → B4 放入料仓(断真空) → 收回 → (B5 附加动作,可选)
 
 协同机制:
   - 中间件令牌 EMPTY/FILLED: 左放前置条件 EMPTY,右取前置条件 FILLED;
@@ -315,7 +315,9 @@ class ArmLoop:
                 "orientation": [float(v) for v in quat]}
 
     def q_deg(self) -> list:
-        q = self.robot.get_joint_angles().get(self.arm) or []
+        # 桥缓存优先(100Hz,毫秒级);DDS 风暴期 :8000 读角一半概率 ~3s,
+        # 每动作 2~4 次读角全是死等(2026-11-05 A2_place 42.5s 的次要来源)
+        q = self.robot.get_joint_angles_fast(self.arm)
         if not q:
             raise RobotError("关节角读取失败")
         return [float(v) for v in q]
@@ -340,7 +342,13 @@ class ArmLoop:
         act = self.runner.cfg["arms"][self.arm]["actions"][name]
         wps = act["waypoints"]
         if not wps:
-            raise ValueError(f"{name} 没有路点 —— 请先在流水线页示教")
+            # 空动作=跳过(2026-11-09:部分示教也要能跑测试;真空触发/
+            # 段后对准都挂在本段路点上,一并自然失效)。臂不动。
+            self.say(f"{name}: 无路点,跳过(真空/对准随段失效)")
+            self._gate_offset = None            # 本段消费不了挂起的闸门Δ,作废
+            self.runner.runlog.event("action_skip", self.arm, action=name,
+                                     reason="no_waypoints")
+            return
         if (meta.get("wait") == "center_free"
                 and self.runner.handoff.center_owner != self.arm):
             # 自己已持锁(center_serialize 的 A1)时不再等 —— 防自等死锁
@@ -452,6 +460,15 @@ class ArmLoop:
             self.say(f"{name}: 完成 {rec['duration_s']}s"
                      f"(speed {speed}%)")
         except BaseException as e:               # 记下失败动作再原样上抛
+            if off is not None and isinstance(e, RobotError):
+                # 重锚段失败别只留一句"未到位":带上 Δ锚 与分型提示
+                # (10-28 14:05/14:26 两次 B2·重锚p1 不可达,根因是中间件
+                #  参考过期把假 Δz 灌进 B2,报错里根本看不出该重录参考)
+                e.args = (f"{e} —— 重锚Δ="
+                          f"{np.round(off * 1000.0, 1).tolist()}mm:"
+                          "实物没挪而闸门Δ大=该站参考过期,重录参考"
+                          "(⚡回观察位并测复核)再试;实物挪过或被挡="
+                          "查工装位置与另一臂占位",)
             rec.update(status=("abort" if isinstance(e, _Abort) else "error"),
                        error=f"{type(e).__name__}: {e}",
                        duration_s=round(time.monotonic() - m0, 3),
@@ -918,6 +935,17 @@ class ArmLoop:
             raise ValueError("物料检测未发现可吸取目标 —— 请补料,"
                              "或到『物料检测』页检查检测配置/光照")
         row = rows[0]                                # 队首(高层优先)
+        # ①+ 悬停位关节回放(不过 IK): 扫描位求视野、悬停位求吸取几何,
+        # 料仓在工作空间边缘时二者不可兼得(2026-11-09 扫描位→袋的笛卡尔
+        # IK 解分支翻转被 45° 护栏拒)。悬停位示教于袋上方·同解枝,
+        # 关节回放无跳解,后续小行程笛卡尔下探从这里出发。
+        hover_pose = pcfg.get("hover_pose")
+        if hover_pose:
+            self.set_phase("pick_hovermove")
+            self.say(f"①+ 关节回放悬停位"
+                     f"({hover_pose.get('created', '?')} 示教)")
+            self._traj([{"joints_deg": hover_pose["joints_deg"]}],
+                       speed_store.get_speed(self.arm), "hover_replay")
         self.say(f"吸取目标 #{row['order']}(层{row['layer']}) "
                  f"{row['cls']} z={row['z_mm']:.0f}mm")
         self.runner.runlog.event(
@@ -1024,6 +1052,17 @@ class ArmLoop:
         return any(bool(w.get("center"))
                    for nm in names for w in acts[nm]["waypoints"])
 
+    def _gate_or_skip(self, obs_action: str, which: str, where: str):
+        """段后对准闸门: 观察位动作有路点才测(Δ 锚在观察位末点上,
+        动作空=无观察位,测出的 Δ 是幻影,绝不能修);空则跳过并提示,
+        后续 reanchor 回放自然退纯关节。"""
+        if self.runner.cfg["arms"][self.arm]["actions"][obs_action]["waypoints"]:
+            self.align_gate(which)
+        else:
+            self.say(f"{obs_action} 空: 跳过{where}对准(无观察位)")
+            self.runner.runlog.event("gate_skip", self.arm, which=which,
+                                     reason=f"{obs_action}_empty")
+
     def _release_center_or_warn(self, name: str):
         """中心段收尾: 仍持锁(示教末点还是中点,没教退出点)则提前
         交锁保活并提示补示教 —— 否则右臂会被堵到本臂下轮回扫描。"""
@@ -1056,7 +1095,7 @@ class ArmLoop:
             try:
                 self.play_action("A1_transfer")
                 self.post_grip("A1_transfer")
-                self.align_gate("align")
+                self._gate_or_skip("A1_transfer", "align", "中间件")
                 if not ser and not self.single_shot:
                     self.runner.handoff.wait_fixture("EMPTY", self)
                 self.play_action("A2_place", reanchor=True)   # 闸门Δ传导
@@ -1069,10 +1108,11 @@ class ArmLoop:
             self.cycles += 1
             self._mark_cycle()
             if self.single_shot:
-                self.say("◎ 单臂测试: 1 个循环完成,自动停止"
-                         "(中间件已置 FILLED,实物留在中间件)")
-                return
-            if self.max_cycles and self.cycles >= self.max_cycles:
+                if self.cycles >= (self.max_cycles or 1):
+                    self.say(f"◎ 单臂测试: {self.cycles} 个循环完成,自动停止"
+                             "(中间件已置 FILLED,实物留在中间件)")
+                    return                       # 未到轮次 → 接着下一循环
+            elif self.max_cycles and self.cycles >= self.max_cycles:
                 self.say(f"◎ 已跑满 {self.max_cycles} 轮,自动停止")
                 return
 
@@ -1123,7 +1163,7 @@ class ArmLoop:
             try:
                 self.play_action("B1_approach")
                 self.post_grip("B1_approach")
-                self.align_gate("align")
+                self._gate_or_skip("B1_approach", "align", "中间件")
                 self.play_action("B2_pick", reanchor=True)    # 闸门Δ传导
                 if wp_center and not b3_holds:
                     self._release_center_or_warn("B2_pick")
@@ -1134,16 +1174,23 @@ class ArmLoop:
             self.post_grip("B2_pick")              # 可选:B2→B3 夹爪整形
             self.play_action("B3_transfer")
             self.post_grip("B3_transfer")
-            self.align_gate("align2")
+            self._gate_or_skip("B3_transfer", "align2", "料仓")
             self.play_action("B4_place", reanchor=True)       # 闸门Δ传导
             self.post_grip("B4_place")
+            # B5 附加动作(可选): B4 后·循环末前,空路点=整段跳过(同 B0)。
+            # 纯示教回放,不接闸门Δ(B4 已消费);其夹爪整形插槽也只在
+            # B5 实际执行时才生效。
+            if self.runner.cfg["arms"][self.arm]["actions"]["B5_extra"]["waypoints"]:
+                self.play_action("B5_extra")
+                self.post_grip("B5_extra")
             self.cycles += 1
             self._mark_cycle()
             if self.single_shot:
-                self.say("◎ 单臂测试: 1 个循环完成,自动停止"
-                         "(中间件已置 EMPTY,请确认料已入仓)")
-                return
-            if self.max_cycles and self.cycles >= self.max_cycles:
+                if self.cycles >= (self.max_cycles or 1):
+                    self.say(f"◎ 单臂测试: {self.cycles} 个循环完成,自动停止"
+                             "(中间件已置 EMPTY,请确认料已入仓)")
+                    return                       # 未到轮次 → 接着下一循环
+            elif self.max_cycles and self.cycles >= self.max_cycles:
                 self.say(f"◎ 已跑满 {self.max_cycles} 轮,自动停止"
                          f"(第 {self.cycles} 件已送完料仓)")
                 return
@@ -1154,18 +1201,25 @@ class ArmLoop:
         dt = time.time() - self._cycle_t0
         self.cycle_ts.append(dt)
         del self.cycle_ts[:-20]
+        # 本轮实际下发过的速度(每动作取一次全局值):顶栏中途改速/动作级
+        # 覆盖都会体现为多值,如 [30, 50] → "30→50%"
+        used = sorted({a.get("speed_pct") for a in self._cycle_actions
+                       if isinstance(a.get("speed_pct"), (int, float))})
+        spd_txt = "→".join(f"{v:g}%" for v in used) \
+            or f"{speed_store.get_speed(self.arm)}%"
         rec = {"cycle": self.cycles,
                "t_start": flow_runlog.iso(self._cycle_t0),
                "t_end": flow_runlog.iso(),
                "duration_s": round(dt, 3),
                "avg_recent_s": round(float(np.mean(self.cycle_ts)), 3),
                "speed_pct": speed_store.get_speed(self.arm),
+               "speeds_used": used,
                "phases": self._cycle_phases,
                "actions": self._cycle_actions,
                "gates": self._cycle_gates}
         self.say(f"◎ 循环 #{self.cycles} 完成 {dt:.1f}s"
                  f"(近均值 {np.mean(self.cycle_ts):.1f}s,"
-                 f"speed {rec['speed_pct']}%)")
+                 f"speed {spd_txt})")
         self.runner.runlog.event("cycle", self.arm, **rec)
 
     def status(self) -> dict:
@@ -1239,6 +1293,12 @@ class FlowRunner:
         self.runlog = flow_runlog.RunLogger(
             tag={"armleft": "left", "armright": "right"}.get(only_arm,
                                                              "dual"))
+        # 多方案:运行日志落方案名(多方案并存后,翻日志先看是哪套)
+        try:
+            self.runlog.line(f"流水线方案: {flow_store.active_flow()}")
+            self.runlog.event("pipeline", name=flow_store.active_flow())
+        except Exception:                               # noqa: BLE001
+            pass
         self._run_t0 = time.time()
         try:
             self._start_arms(cfg, robot, only_arm, step_mode)
@@ -1257,7 +1317,8 @@ class FlowRunner:
         self.arms = {a: ArmLoop(self, a) for a in wanted}
         for loop in self.arms.values():
             loop.single_shot = only_arm is not None
-            loop.max_cycles = 1 if only_arm else self.rounds
+            # 单臂测试也吃轮次:填 N=跑 N 循环,留空/0=保持 1 循环旧语义
+            loop.max_cycles = (self.rounds or 1) if only_arm else self.rounds
         self.pick_adapter = self.cameras.as_pick_provider("left")
         # 预热相机: 左臂扫描路(带深度)在 start 时就要用,提前把租约拿到;
         # 右臂单测用不到左深度,只热右相机彩色(免深度租约)
@@ -1269,7 +1330,8 @@ class FlowRunner:
         self._running = True
         self.note(f"流水线启动(mode={cfg['gate']['mode']}"
                   f"{', 单步确认' if step_mode else ''}"
-                  + (f", 单臂测试:{only_arm} 仅1循环" if only_arm else
+                  + (f", 单臂测试:{only_arm} 仅"
+                     f"{(self.rounds or 1)}循环" if only_arm else
                      (f", {self.rounds}轮后自动停" if self.rounds else
                       ", 连续")) + ")")
         self._log_start(cfg, only_arm, step_mode)
