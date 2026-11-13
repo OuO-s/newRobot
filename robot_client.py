@@ -456,25 +456,38 @@ class TianlianRobot:
         }, timeout=timeout + 8.0)
 
     # ------------------------------------------------------- 末端执行器(8000)
+    @staticmethod
+    def _side_key(side: str) -> str:
+        """:8000 末端接口的 key 是 left/right;兼容 armleft/armright
+        (网页 /api/gripper 传 _normalize_arm 的输出,不转会被 422)。"""
+        s = (side or "").strip().lower()
+        if s in ("armleft", "left"):
+            return "left"
+        if s in ("armright", "right"):
+            return "right"
+        raise RobotError(f"未知臂: {side!r}(期望 left/right/armleft/armright)")
+
     def set_gripper(self, side: str, position: float,
                     velocity: float | None = None, effort: float | None = None) -> dict:
-        """二指夹爪控制。side: left/right;position 开口 0~1000。"""
+        """二指夹爪控制。side: left/right(兼容 armleft/armright);position 开口 0~1000。"""
         target: dict = {"position": float(position)}
         if velocity is not None:
             target["velocity"] = float(velocity)
         if effort is not None:
             target["effort"] = float(effort)
-        return self._post_arm("/set_manipulator_states", {side: {"open": target}})
+        return self._post_arm("/set_manipulator_states",
+                              {self._side_key(side): {"open": target}})
 
     def set_hand_joints(self, side: str, names: list[str], position: float) -> dict:
         """灵巧手:所有指定关节运动到同一 position(0~1000)。"""
         joints = {n: {"position": float(position)} for n in names}
-        return self._post_arm("/set_manipulator_states", {side: {"joints": joints}})
+        return self._post_arm("/set_manipulator_states",
+                              {self._side_key(side): {"joints": joints}})
 
     def set_end_effector(self, side: str, position: float) -> dict:
         """按当前末端类型自动选择夹爪/灵巧手接口。"""
         states = self.get_manipulator_states()
-        info = states.get(side) or {}
+        info = states.get(self._side_key(side)) or {}
         if info.get("type") == "hand":
             names = list((info.get("joints") or {}).keys())
             if not names:

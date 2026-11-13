@@ -1,133 +1,139 @@
-# 裁剪机构接入 — 机器人侧集成指南
+# 裁剪机构接入 — Jetson WebSocket 版(2026-11-11 已实装)
 
-目标目录: `/home/user/tianlian/tianlian_webapp/`（FastAPI, app.py + static/app.js）
-桥接服务: `http://10.245.169.20:8100`（Windows 电脑, CH340→RS485→驱动器, Modbus-RTU）
-
-共 5 处改动。**cutter_client.py 是新文件直接放进去**，其余 4 处按下面的锚点插入。
-
----
-
-## 1. 新文件 `cutter_client.py` ✅ 已写好（本目录同名文件），直接拷贝到 webapp 根目录
-
-## 2. `flow_store.py` — DEFAULTS 加 cutter 节 + 读写助手
-
-`DEFAULTS`（约 :88，与 gate/move 平级）追加：
-
-```python
-"cutter": {
-    "base_url": "http://10.245.169.20:8100",
-    "default_turns": -4,       # 默认反转4圈
-    "rpm": 240,
-    "move_timeout_s": 60,
-    "poll_s": 0.3,
-},
-```
-
-再加（镜像现有 set_action_vacuum 的写法）：
-
-```python
-def set_action_cutter(title, cutter_cfg):
-    """cutter_cfg = {"turns": -4} | None(=删除触发器)"""
-    cfg = load_config()
-    act = _find_action(cfg, title)          # ← 复用你们现有的动作查找函数
-    if cutter_cfg is None:
-        act.pop("cutter", None)
-    else:
-        act["cutter"] = {"turns": float(cutter_cfg.get("turns", -4))}
-    save_config(cfg)
-    return act
-```
-
-## 3. `flow.py` — play_action 触发块（镜像 vacuum, 约 :443 触发点）
-
-在 vacuum 触发逻辑旁边（同一个“到点→wait_s→触发”顺序）加：
-
-```python
-from cutter_client import CutterClient, CutterError
-
-# --- cutter 触发: 语义同 vacuum.at, act.get("cutter") = {"turns": -4} ---
-cutter_trig = act.get("cutter")
-if cutter_trig and _hit_trigger(cutter_trig.get("at", "end"), wp_idx, total):  # ← 复用 vacuum 的触发点计算
-    ccfg = flow_store.load_config().get("cutter", {})
-    client = CutterClient(ccfg.get("base_url", "http://10.245.169.20:8100"))
-    client.trigger(ccfg, cutter_trig)   # 阻塞等到位; 失败抛 CutterError → 停线
-```
-
-急停/abort 路径（现有 estop 处理处）兜底加：
-
-```python
-try:
-    CutterClient(cfg.get("cutter", {}).get("base_url", "")).stop()
-except Exception:
-    pass
-```
-
-## 4. `app.py` — 手动测试端点（放其它 /api/flow/* 附近）
-
-```python
-from cutter_client import CutterClient, CutterError
-
-def _cutter():  # 从配置取 base_url
-    return CutterClient(flow_store.load_config().get("cutter", {}).get(
-        "base_url", "http://10.245.169.20:8100"))
-
-@app.get("/api/cutter/health")
-def cutter_health():
-    return _cutter().health()
-
-@app.get("/api/cutter/status")
-def cutter_status():
-    return _cutter().status()
-
-@app.post("/api/cutter/move")
-def cutter_move(turns: float = -4):
-    return _cutter().move_and_wait(turns)   # 手动点=等待到位
-
-@app.post("/api/cutter/stop")
-def cutter_stop():
-    return _cutter().stop()
-
-@app.post("/api/flow/action/cutter")
-def flow_action_cutter(title: str, body: dict = Body(...)):
-    """设置/删除动作的裁剪触发器 body: {"turns": -4} 或 {} = 删除"""
-    return flow_store.set_action_cutter(title, body or None)
-```
-
-## 5. `static/app.js` — 动作面板配置 UI
-
-在 vacuum 触发器配置行（action 面板里）旁边镜像加一行：
-
-```javascript
-// HTML(index.html 动作面板): <label>✂️ 裁剪 <input id="actCutterTurns" type="number" value="-4" size="4"> 圈
-//                            <button id="btnActCutter">挂载/更新</button> <button id="btnActCutterDel">删除</button></label>
-async function setActionCutter(del) {
-  const title = currentActionTitle();              // ← 复用面板现有的动作选择
-  const body = del ? {} : { turns: parseFloat(document.getElementById('actCutterTurns').value || -4) };
-  await fetch(`/api/flow/action/cutter?title=${encodeURIComponent(title)}`, {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: del ? '{}' : JSON.stringify(body) });
-}
-// 载入动作时回显: act.cutter?.turns -> actCutterTurns.value
-```
-
-顶栏 base_url 配置（可选, 将来换 IP 网页一行改）：
-```javascript
-// 保存: POST /api/flow/config {"cutter": {...cfg, base_url: 新值}}  (走你们现有的 save_config 通道)
-```
+> 本文取代旧的 HTTP 桥(10.245.169.20:8100/Modbus)方案 —— 该桥已废弃。
+> 现在裁剪机构由 **Jetson 直控**: `10.245.169.248`(root / allrank8888)
+> 上的 `/ssd/control/ws_control.py`,通过 **WebSocket :8765** 收 JSON 指令、
+> 回动作完成。机器人侧不再需要任何中间桥。
 
 ---
 
-## 验证顺序
+## 1. 架构与协议速览
 
-1. `curl http://10.245.169.20:8100/api/cutter/health` ✅（已通）
-2. 集成后在网页手动测: `POST /api/cutter/move?turns=-4`（SIM 模式, 立即到位）
-3. 示教 B5_extra 到裁剪位 → 挂 cutter 触发器 → 跑一遍流水线
-4. **真机前**: Windows 侧插上 CH340 → 重启 cutter_bridge（自动连真实串口）→ health 里
-   `"simulated": false` 才是真机; `true` 一律是模拟。
+```
+webapp(flow.py) ── CutterFlow ── CutterWS ── ws://10.245.169.248:8765
+                                                     │ Jetson: /ssd/control/ws_control.py
+                                                     ├─ 推杆(左限位=剪切 / 右限位=回位)
+                                                     └─ 升降台(上/下限位开关 + 按圈数走脉冲)
+```
 
-## 注意
+- **指令**: `push`(推杆往返) / `lift`(dir+revs) / `cycle`(推杆+升降联动) /
+  `stop` / `status`
+- **应答三段**: `hello`(连接即发,带 busy/last_done) → `ack`(受理) →
+  `done`(动作完成,含 `ok/ms/legs[]`,每条腿 `result` =
+  `limit_neg/limit_pos/position/aborted/timeout/comms/error`)
+- **一次只执行一个动作**(busy 期间新指令回 `busy` 错);动作独立于连接跑完,
+  结果留在服务端 `last_done`,断线重连可对账找回
+- `cycle` 联动(对应手动控制台按钮 7/8):
+  - **cycle + down**: 推杆去程剪切 → **回程同时升降降到下限位(最低)**
+  - **cycle + up**: 推杆去程剪切 → **回程同时升降升到上限位(最高)**
 
-- 桥接 SIM 模式一切返回成功但机构不动，接真机前务必确认 `simulated: false`
-- Windows 电脑重启后需要重新启动桥接: `.venv\Scripts\python.exe cutter_bridge.py`
-  （后续可做成开机自启/计划任务）
-- 驱动器拨码须为 SW1=ON, SW6/SW7=OFF（RS-485 模式）, A-B 线序正确
+## 2. 代码落点(全在本仓库,已全部实装+测试)
+
+| 文件 | 内容 |
+|---|---|
+| `cutter_client.py` | `CutterWS`(线程安全 ws 客户端: 后台事件循环线程/断线恢复/last_done 对账) + `CutterFlow`(面向流程的高层封装,含 SIM 模式) + `probe()` |
+| `flow_store.py` | `DEFAULTS["cutter"]`(enabled/sim/ws_url/**middle_revs**/**push_speed_rpm**/push_timeout_s/lift_timeout_s) + update_config 校验 + readiness 探活 |
+| `flow.py` | `Handoff.center_enabled`(裁剪方案中心锁整体停用) + `_loop_left_cutter()`(左臂裁剪编排) + FlowRunner.cutter 生命周期(启动建连/结束关闭/软停后台 stop) |
+| `app.py` | `GET /api/flow/cutter/status`(探活) + `POST /api/flow/cutter/cmd`(手动驱动,运行中拒绝运动类指令) |
+| `static/index.html` + `app.js` | 「✂️ 裁剪机构」卡片: 配置行 + 手动按钮(回零/最低/中间点/N圈点动/三种推/全停) |
+| `flow_data/flows/流水线3.json` | `gate.mode="startup"` + `cutter.enabled=true`,全部路点留空待示教 |
+
+## 3. 一轮工作流程(2026-11-12 二次重排: 左右臂完全独立,机构步全并行)
+
+```
+启动: 升降回零(升到上限位钉停) —— 每次运行仅一次
+┌ 左臂(每轮,只在 A2 点2 等推杆,其余不停) ──────────────────┐
+│ 【轮首后台: (等上轮推②完成→)等右臂清空(EMPTY)→升降到中间  │
+│  点】‖ A1 吸取位 → 自动视觉吸取第1摞 → A2 点2              │
+│   →(首轮直接过/后续轮先等上轮推②回位=托盘让位)→ 断真空放  │
+│ 【放好①摞即后台: (升降通常早已到中间)→ 推①】              │
+│   ‖ 同时 A1 吸取第2摞 → A2 点2 → 等推①回位(已回=直接放)   │
+│   → 断真空放第2摞                                         │
+│ 推②(联动升)异步发出,完成线程自动置 FILLED —— 左臂不等,  │
+│ 立刻进下一轮吸取                                          │
+└───────────────────────────────────────────────────────────┘
+┌ 右臂(只看 FILLED) ────────────────────────────────────────┐
+│ 等待期间预先就位 B2 点1 → FILLED(=推②完成+升降到最高)→     │
+│ B2 一次夹走两摞 → B3/B4 入料仓 → 置 EMPTY(升降才允许降)   │
+└ 左臂推两摞、右臂夹一次 = 一轮 ──────────────────────────────┘
+```
+
+**要点**:
+- 左臂全程**不等右臂/令牌**(单臂测试同样不等);唯一等待=A2 点2 等推杆
+  回位。现场已确认推杆扫过 A2 点2 不会碰到吸嘴,到位等待是安全的。
+- 升降降中间点在**轮首**就发(后台线程): [(上轮推②完成→)右臂清空
+  (EMPTY)] → 降到中间点,**与吸第1摞完全并行**。首轮 EMPTY 本就置位,
+  回零一完成升降就开始降 —— 臂到 A2 点2 时升降已在中间点(11-12 复盘
+  问题②: 旧版排在"放完第1摞"后,首次启动臂都到了点2 升降才开始降,
+  循环后因等待叠进吸料而看不出来)。推①另起线程等 `lift_done` 事件:
+  完整门禁 = ①摞已放好 + 升降已在中间 + 右臂已清空,Jetson 不会被
+  busy 拒。
+- A2 现 2 点示教(接近/放料位): 到点2 后由循环**显式触发断真空**放料;
+  若以后示教 ≥3 点(等待/下降/抬起),[2:] 段按示教走、真空按绝对路点号
+  在段内触发(配 `at=下降点号`),循环不再显式断真空。
+- **左臂吸盘电磁阀已接硬件**(2026-11-13,此前为人工手控): 链路 =
+  Jetson `/ssd/control/dist/valve_min.py`(USB-485 @9600 BESTEP 双路
+  继电器,port C=通道1/U=通道2)→ AirTAC 4V210-08 单电控阀。**通电=吸,
+  断电=弹簧复位放料(物料自由落体)**。ws_control.py 新增 `"valve"`
+  指令(`{"cmd":"valve","on":true,"port":"C"}`,即时执行**不受 busy
+  门禁** —— 推杆动作期间也要能放料;继电器无应答 → done.ok=false)。
+  webapp 侧: `CutterFlow.valve()` → `flow.py::_set_vacuum_valve`;
+  流水线3 左臂 `vacuum_grab/vacuum_release` 与『物料检测』页真空模式
+  已全部翻成 `valve`(grab=视觉吸取下压完成后通电,release=A2 点2
+  推杆回位后断电);阀失败即停线(该吸没吸/该放没放都不能静默跑)。
+  手动验接线: 裁剪机构卡片「🔌 吸盘阀·通电/⚡ 断电」按钮(流水线
+  运行中拒绝,阀归编排管)。状态查询带 `valve` 字段(true/false/null)。
+- 闸门观察位=A2 点2;startup 模式首轮定标全程平移。
+- 令牌语义沿用中间件方案: `EMPTY`=升降台可降(右臂已取走) /
+  `FILLED`=两摞已在最高点(右臂可取)
+- 左右半区不交叉 → **中心互斥整体停用**(`●中点` 标记失效,
+  `⏱wait_s` 等待仍有效)
+- 每轮第⑥步 `cycle(up)` 撞上限位 = 免漂移的重对齐,
+  所以中间点只需标定一次
+
+## 4. 中间点标定(现场必做)
+
+中间点 = **最高点向下 `middle_revs` 圈**(默认 11.0,取自 Jetson 上
+`double_control_linux.py` 的 `LIFT_DEF_REVS`,与手动控制台按钮 4 的 N 同源)。
+
+标定流程(网页「✂️ 裁剪机构」卡片,流水线停止时才能动):
+1. `升降↑到顶` —— 撞上限位钉停(基准)
+2. `↓N圈` 小步试(输入框填圈数,反复点到高度合适)
+3. 数出的总圈数填进 `中间点圈数`,点「存配置」
+4. `→中间点` 验证一次到位高度正合适
+
+升降下限位在下、且 Jetson 会在 `limit_neg`(下限位)时报警 ——
+若 `middle_revs` 设太大,`lift_middle` 会直接报错(腿结果=`limit_neg`),
+把圈数改小即可,不会撞坏。
+
+## 5. 现场启动清单(按顺序)
+
+1. **Jetson**: `ssh root@10.245.169.248` → `cd /ssd/control` →
+   起 `ws_control.py`(需 485 硬件在位;当前**未在跑**)
+2. 网页「✂️ 裁剪机构」→「查状态」应显示 `busy:false`(readiness 也会探)
+3. 按上节标定中间点(如双控台已确认 11 圈准,可跳过)
+4. 切到**流水线3**,示教全部路点(A1/A2/B1~B4 为空,网页示教按钮)
+5. 录闸门参考码(对准观察位,A1_transfer 挂 align;startup 模式仅首次测)
+6. SIM 关掉(cfg.cutter.sim=false,默认已是 false)
+
+**推杆速度**: `cutter.push_speed_rpm`(默认 **1000** r/min)随 push/cycle 指令下发,
+只写推杆驱动器(站1);0=不带、用 Jetson 服务端默认 1200。**升降腿恒 300 r/min**
+(Jetson 注释实测 >300 堵转),不在此调。网页裁剪卡片「推速」输入框可改(0 或 10~3000)。
+7. 先单步/低速空跑一轮(左臂测试按钮带轮次,单臂模式不等令牌,
+   注意⓸的教训: 单臂测左臂时升降台动作是真实的)
+
+## 6. 排障
+
+| 现象 | 含义/处理 |
+|---|---|
+| `裁剪机构不可达 ws://…(ConnectionRefused…)` | Jetson 上 ws_control.py 没起 |
+| `busy` | 上一动作没完(一次只收一条);「查状态」看 job,必要点「全停」 |
+| 腿结果 `limit_neg` | `middle_revs` 太大冲到下限位 → 调小 |
+| 腿结果 `limit_pos` | 撞上限位钉停 —— 对"升到最高/回零"是**正常**停法 |
+| 腿结果 `aborted` | 有人按了全停;流水线侧按软停处理,不算故障 |
+| `结果丢失(重启?)` | 断线期间动作已完成但 last_done 已被顶掉 → 现场目视确认机构位置再继续 |
+| 推杆停在半途 | 点「全停」→「推(往返)」回右限位 → 重新回零再跑 |
+| 流水线软停不动 | 软停会让**当前动作走完**才停(安全),等几秒;急停才立即断 |
+
+SIM 模式(`sim=true`)一切返回成功但机构不动 —— 联调界面逻辑用,
+真机前务必关掉(状态行会标注 `(SIM)`)。

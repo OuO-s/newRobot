@@ -54,6 +54,11 @@ const API = {
   pkStop:        () => post('/api/pick/stop', {}),
   flConfigGet:   () => fetch('/api/flow/config').then(r => r.json()),
   flConfigSet:   (b) => post('/api/flow/config', b),
+  flCutterStatus: () => fetch('/api/flow/cutter/status').then(r => {
+    if (!r.ok) return r.json().then(d => { throw new Error(d.detail || r.statusText); });
+    return r.json();
+  }),
+  flCutterCmd:   (b) => post('/api/flow/cutter/cmd', b),
   flFlowSwitch:  (name) => post('/api/flow/flows/active', { name }),
   flFlowCreate:  (name, copyFrom) => post('/api/flow/flows/create', { name, copy_from: copyFrom }),
   flFlowDel:     (name) => post('/api/flow/flows/delete', { name }),
@@ -77,12 +82,6 @@ const API = {
   flStop:        () => post('/api/flow/stop', {}),
   flStepOk:      () => post('/api/flow/step/confirm', {}),
   flStatus:      () => fetch('/api/flow/status').then(r => r.json()),
-  flRpt:         async (start, end) => {
-    const r = await fetch(`/api/flow/logs/preview?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`);
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(d.detail || r.statusText);
-    return d;
-  },
   ikAvail:       () => fetch('/api/ik/availability').then(r => r.json()),
   camStart:      (cam, ms) => post('/api/camera/start', { cam, interval_ms: ms }),
   camStop:       (cam) => post('/api/camera/stop?cam=' + encodeURIComponent(cam)),
@@ -2242,8 +2241,13 @@ function flRender(r) {
   document.getElementById('flRMk2Data').value = ra.align2.marker.data ?? '';
   document.getElementById('flRMk2Size').value = ra.align2.marker_size_mm;
   flRenderGrips(r);
-  flRefLine('flRefInfoL', [['中间件', la.ref]]);
-  flRefLine('flRefInfoR', [['中间件', ra.align.ref], ['料仓', ra.align2.ref]]);
+  flCutterRender(r.config);
+  flPBVSLayout(r.config);
+  const cutter = r.config.cutter && r.config.cutter.enabled;
+  flRefLine('flRefInfoL', [[cutter ? '裁剪放料区' : '中间件', la.ref]]);
+  flRefLine('flRefInfoR', cutter
+    ? [['裁剪取料位', ra.align.ref]]
+    : [['中间件', ra.align.ref], ['料仓', ra.align2.ref]]);
   const snapL = la.ref && la.ref.snapshot;
   const imL = document.getElementById('flRefSnapL');
   imL.style.display = snapL ? '' : 'none';
@@ -2255,6 +2259,21 @@ function flRender(r) {
   if (snapR) imR.src = snapR;
   flRenderActions('armleft', 'flActsLeft', r);
   flRenderActions('armright', 'flActsRight', r);
+}
+
+// PBVS 参考卡布局随流程形态切换: 流水线3(裁剪)每臂只有一处,R2 料仓站隐藏
+function flPBVSLayout(cfg) {
+  const cutter = cfg && cfg.cutter && cfg.cutter.enabled;
+  const wrap = document.getElementById('flPBVSR2Wrap');
+  if (wrap) wrap.style.display = cutter ? 'none' : '';
+  const lt = document.getElementById('flPBVSLTitle');
+  if (lt) lt.textContent = cutter
+    ? '🦾 左臂 PBVS · 裁剪放料区(观察位 = A2 点2 · 启动时测一次,Δ 应用于本轮全部动作/轮次)'
+    : '🦾 左臂 PBVS · 中间件(观察位 = A1 末点)';
+  const rt = document.getElementById('flPBVSR1Title');
+  if (rt) rt.textContent = cutter
+    ? '🦿 右臂 PBVS · 裁剪取料位(观察位 = B2 点1 · 启动时测一次,Δ 应用于本轮全部动作/轮次)'
+    : '🦿 右臂 PBVS · 中间件(观察位 = B1 末点)';
 }
 
 function flRefLine(id, items) {
@@ -2530,6 +2549,83 @@ document.getElementById('flSaveMkR').addEventListener('click', async () => {
   } catch (e) { toast(e.message, 'error'); }
 });
 
+// ── 裁剪机构(Jetson 推杆+升降台,流水线3)── 配置渲染 + 手动联调 ──
+const FL_PHASE_LABEL_CUTTER = {
+  A1_transfer: 'A1 吸取位', A2_place: 'A2 放料正上方',
+  B1_approach: 'B1 到升降台',
+  B2_pick: 'B2 夹取两摞', wait_empty: '等右臂取走', wait_filled: '等两摞就绪',
+  cutter_home: '升降回零(最高)', cutter_lift_mid: '升降→中间点',
+  cutter_push1: '推①联动降', cutter_wait_push1: '等推①回位',
+  cutter_wait_push2: '等上轮推②回位',
+  cutter_push2: '推②联动升',
+};
+const FL_PHASE_LABEL_NORMAL = {
+  A1_transfer: 'A1 转移', A2_place: 'A2 放中间件', B1_approach: 'B1 到中间件',
+  B2_pick: 'B2 取料',
+  wait_empty: '等中间件空', wait_filled: '等中间件有料',
+};
+function flCutterRender(cfg) {
+  const c = (cfg && cfg.cutter) || {};
+  document.getElementById('flCutEn').checked = !!c.enabled;
+  document.getElementById('flCutSim').checked = !!c.sim;
+  document.getElementById('flCutUrl').value = c.ws_url || '';
+  document.getElementById('flCutMid').value = c.middle_revs ?? 11;
+  document.getElementById('flCutSpd').value = c.push_speed_rpm ?? 0;
+  Object.assign(FL_PHASE_LABEL, FL_PHASE_LABEL_NORMAL);
+  if (c.enabled) Object.assign(FL_PHASE_LABEL, FL_PHASE_LABEL_CUTTER);
+}
+document.getElementById('flCutSave').addEventListener('click', async () => {
+  try {
+    await API.flConfigSet({ cutter: {
+      enabled: document.getElementById('flCutEn').checked,
+      sim: document.getElementById('flCutSim').checked,
+      ws_url: document.getElementById('flCutUrl').value.trim(),
+      middle_revs: +document.getElementById('flCutMid').value,
+      push_speed_rpm: +document.getElementById('flCutSpd').value } });
+    toast('裁剪机构配置已存(对下次启动生效)', 'success');
+    flRefresh();
+  } catch (e) { toast(e.message, 'error'); }
+});
+const flCutOut = document.getElementById('flCutOut');
+function flCutLog(s) {
+  flCutOut.textContent = `[${new Date().toTimeString().slice(0, 8)}] ${s}`;
+}
+let flCutBusy = false;
+async function flCutCmd(cmd, revs, label, urgent) {
+  if (flCutBusy && !urgent) {
+    toast('上一条裁剪指令还没回(每次只执行一个动作;全停不受限)', 'error');
+    return;
+  }
+  if (!urgent && !confirm(`真动裁剪机构: ${label || cmd} ?`)) return;
+  flCutBusy = true;
+  flCutLog(`▶ ${label || cmd} 已发,等动作完成…`);
+  try {
+    const r = await API.flCutterCmd({ cmd, revs });
+    flCutLog(`✓ ${label || cmd} 完成: ${JSON.stringify(r.done)}`);
+  } catch (e) {
+    flCutLog(`✗ ${label || cmd}: ${e.message}`);
+    toast(e.message, 'error');
+  } finally { flCutBusy = false; }
+}
+document.getElementById('flCutProbe').addEventListener('click', async () => {
+  try {
+    const r = await API.flCutterStatus();
+    flCutLog(`连接正常${r.sim ? '(SIM)' : ''} @${r.url}: ${JSON.stringify(r.status)}`);
+  } catch (e) { flCutLog(`✗ 不可达: ${e.message}`); }
+});
+document.getElementById('flCutTop').addEventListener('click', () => flCutCmd('lift_highest'));
+document.getElementById('flCutLow').addEventListener('click', () => flCutCmd('lift_lowest'));
+const flCutStepRevs = () => +document.getElementById('flCutRevs').value || 1;
+document.getElementById('flCutUpN').addEventListener('click', () => flCutCmd('lift_up_revs', flCutStepRevs()));
+document.getElementById('flCutDnN').addEventListener('click', () => flCutCmd('lift_down_revs', flCutStepRevs()));
+document.getElementById('flCutMidGo').addEventListener('click', () => flCutCmd('lift_middle'));
+document.getElementById('flCutPush').addEventListener('click', () => flCutCmd('push'));
+document.getElementById('flCutPushD').addEventListener('click', () => flCutCmd('push_lift_down'));
+document.getElementById('flCutPushU').addEventListener('click', () => flCutCmd('push_lift_up'));
+document.getElementById('flCutValveOn').addEventListener('click', () => flCutCmd('valve_on', null, '吸盘阀通电(吸)'));
+document.getElementById('flCutValveOff').addEventListener('click', () => flCutCmd('valve_off', null, '吸盘阀断电(放)'));
+document.getElementById('flCutStop').addEventListener('click', () => flCutCmd('stop', null, '全停', true));
+
 // 动作间夹爪整形: 渲染 + 保存
 function flRenderGrips(r) {
   const el = document.getElementById('flGripList');
@@ -2679,75 +2775,9 @@ document.getElementById('flStepOk').addEventListener('click', async () => {
   try { await API.flStepOk(); } catch (e) { toast(e.message, 'error'); }
 });
 
-// ---- 运行报告(客户视图: 按时间段聚合每轮 A/B 大步,默认当天) ----
-function flFmtDur(s) {
-  if (s === null || s === undefined) return '-';
-  return s >= 60 ? `${Math.floor(s / 60)}分${Math.round(s % 60)}秒` : `${s}秒`;
-}
-function flRptRender(rep) {
-  const box = document.getElementById('flRptBox');
-  const rs = rep.rounds || [];
-  if (!rs.length) {
-    box.className = 'muted';
-    box.textContent = '该时间段无流水线记录。';
-    return;
-  }
-  const s = rep.summary || {};
-  const rows = [];
-  for (const r of rs) {
-    for (const st of (r.steps || [])) {
-      rows.push(`<tr><td>第${r.session}次</td><td>第${r.round}轮</td>` +
-      `<td>${st.arm_label}臂</td>` +
-        `<td>${st.name}</td><td>${st.start || '-'}</td>` +
-        `<td>${st.end || (st.ongoing ? '进行中' : '-')}</td>` +
-        `<td>${st.ongoing ? '进行中' : flFmtDur(st.duration_s)}</td>` +
-        `<td></td></tr>`);
-    }
-    rows.push(`<tr class="flrpt-sub"><td>第${r.session}次</td><td>第${r.round}轮</td>` +
-      `<td></td>` +
-      `<td><b>本轮小计${r.ongoing ? '(进行中)' : ''}</b></td>` +
-      `<td>${r.start || '-'}</td>` +
-      `<td>${r.end || (r.ongoing ? '进行中' : '-')}</td>` +
-      `<td><b>${r.ongoing ? '-' : flFmtDur(r.duration_s)}</b></td>` +
-      `<td><b>${r.speed_txt || '-'}</b></td></tr>`);
-  }
-  box.className = '';
-  box.innerHTML =
-    `<div class="muted" style="margin:2px 0 6px;">统计区间 ` +
-    `${(s.range || {}).start || '-'} ~ ${(s.range || {}).end || '-'}` +
-    ` | 共 ${s.sessions_total ?? 0} 次 / ${s.rounds_total ?? 0} 轮` +
-    (s.ongoing_rounds ? `(另 ${s.ongoing_rounds} 轮进行中)` : '') +
-    ` | 累计 ${flFmtDur(s.total_s)} | 平均每轮 ${flFmtDur(s.avg_s)}` +
-    (s.first_start ? ` | 首轮开始 ${s.first_start}` : '') + '</div>' +
-    '<table class="flrpt"><thead><tr><th>次</th><th>轮次</th><th>臂</th><th>大步</th>' +
-    '<th>开始时间</th><th>结束时间</th><th>耗时</th><th>速度</th></tr></thead><tbody>' +
-    rows.join('') + '</tbody></table>';
-}
-{ // 默认当天(本地时区,避开 toISOString 的 UTC 偏移)
-  const today = new Date(); today.setMinutes(today.getMinutes() - today.getTimezoneOffset());
-  const ds = today.toISOString().slice(0, 10);
-  document.getElementById('flRptStart').value = ds;
-  document.getElementById('flRptEnd').value = ds;
-}
-document.getElementById('flRptView').addEventListener('click', async () => {
-  const start = document.getElementById('flRptStart').value.trim();
-  const end = document.getElementById('flRptEnd').value.trim();
-  const box = document.getElementById('flRptBox');
-  box.className = 'muted';
-  box.textContent = '查询中…';
-  try { flRptRender(await API.flRpt(start, end)); }
-  catch (e) { box.textContent = '查询失败: ' + e.message; toast(e.message, 'error'); }
-});
-document.getElementById('flRptExport').addEventListener('click', () => {
-  const a = document.createElement('a');
-  a.href = '/api/flow/logs/export?start=' +
-           encodeURIComponent(document.getElementById('flRptStart').value.trim()) +
-           '&end=' +
-           encodeURIComponent(document.getElementById('flRptEnd').value.trim());
-  a.download = '';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
+// ---- 运行报告: 独立页 /report(第9 Tab 只留入口按钮,本页不再内嵌渲染) ----
+document.getElementById('flRptOpen').addEventListener('click', () => {
+  window.open('/report', '_blank');
 });
 
 function flLogBox(id, lines) {
@@ -2768,6 +2798,11 @@ async function flPoll(force) {
     } catch (e) { break; }
     flBadge(document.getElementById('flFixture'),
             s.fixture === 'FILLED', '中间件:' + (s.fixture || '-'));
+    const rd = s.rounds;
+    flBadge(document.getElementById('flRounds'), !!rd && rd.done > 1,
+            rd && rd.done ? `轮 ${rd.done} · 首轮${rd.first_s ?? '-'}s` +
+              (rd.avg_steady_s != null ? ` · 稳态均${rd.avg_steady_s}s` : '')
+            : '轮:未完成');
     for (const [arm, ph, st, lg] of [
       ['armleft', 'flPhaseL', 'flStatL', 'flLogL'],
       ['armright', 'flPhaseR', 'flStatR', 'flLogR']]) {

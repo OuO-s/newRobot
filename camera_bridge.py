@@ -161,6 +161,32 @@ class JointStore:
 
 JOINTS = JointStore()
 
+
+class ManipStore:
+    """/fd_robot/manipulator/current_joint_states 订阅缓存(夹爪实际开口)。
+
+    tl_driver 持续上报 *_jaw 实际位置(0~1000)——这是真实反馈不是指令
+    回声::8000 指令黑洞期它纹丝不动(2026-11-12 实证,判夹爪动没动
+    不能信 :8000 的 get_manipulator_states,那个恒 1000)。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._jaw: dict = {}                    # name → (position, monotonic)
+
+    def update(self, msg: JointState) -> None:
+        now = time.monotonic()
+        with self._lock:
+            for name, pos in zip(msg.name, msg.position):
+                self._jaw[str(name)] = (float(pos), now)
+
+    def jaw(self, name: str):
+        with self._lock:
+            return self._jaw.get(name)          # (pos, mono) | None
+
+
+MANIP_STORE = ManipStore()
+MANIP = {"pub": None}         # BridgeNode 的 joint_state_cmd publisher
+
 # —— 机械臂运动代理(2026-11-05) ——
 # :8000 fd_arm_http 是 Python rclpy:一次 /move_robotarm 要过 5 次 DDS 往返
 # (set_speed + get_state(取插值起点) + goal + result…),DDS 风暴期(对端

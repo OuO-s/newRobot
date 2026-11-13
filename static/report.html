@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>运行报告 · 双臂流水线</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">📈 双臂流水线 · 运行报告</div>
+    <div class="conn" style="flex-wrap:wrap;gap:8px;">
+      <select id="rpRun" title="按日志册(一次启动)查询;选『按时间段』则用右侧时间框"></select>
+      <label>自 <input id="rpStart" type="datetime-local" step="1" /></label>
+      <label>至 <input id="rpEnd" type="datetime-local" step="1" /></label>
+      <button id="rpView" class="primary">🔍 查询</button>
+      <button id="rpExport">⬇ 导出 CSV</button>
+      <label title="流水线在跑时每 5 秒自动重查当前时间段"><input type="checkbox" id="rpAuto" checked /> 自动刷新</label>
+      <a href="/" target="_blank">← 控制台</a>
+    </div>
+  </header>
+  <main>
+    <div id="rpBox" class="muted">加载中…</div>
+  </main>
+<script>
+'use strict';
+// ===================== 小工具 =====================
+const $ = id => document.getElementById(id);
+const esc = v => String(v ?? '').replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtDur = s => (s === null || s === undefined) ? '-'
+  : s >= 60 ? `${Math.floor(s / 60)}分${Math.round(s % 60)}秒` : `${s}秒`;
+const hms = t => { const d = new Date(t * 1000), p = n => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; };
+const CIRC = '①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳';
+const circNo = n => n <= CIRC.length ? CIRC[n - 1] : `#${n}`;
+const PICK_NAME = '视觉吸取(自动)';          // 与 flow_runlog._FIXED_STEP 对齐
+
+function tipWire() {
+  let t = document.getElementById('flTip');
+  if (!t) { t = document.createElement('div'); t.id = 'flTip';
+    document.body.appendChild(t); }
+  return t;
+}
+
+// ===================== 整程甘特(一次启动一行) =====================
+// 轮分界线=灰实线(右臂收口即下一轮起点), FILLED=蓝虚线; 块间 1px 分隔环;
+// 关键步(动作/吸取/机构)放不进块内时上下交替标注; 吸取按次序编号。
+function ganttRun(u) {
+  const lanes = [['armleft', '左臂', 'l'], ['armright', '右臂', 'r'],
+                 ['cutter', '机构', 'c']];
+  const blocks = u.blocks || {};
+  let t0 = u.t_start ?? Infinity, t1 = u.t_end ?? -Infinity;
+  for (const arr of Object.values(blocks))
+    for (const b of arr) { t0 = Math.min(t0, b.t0); t1 = Math.max(t1, b.t1 ?? b.t0); }
+  for (const t of (u.filled_ts || [])) { t0 = Math.min(t0, t); t1 = Math.max(t1, t); }
+  if (u.pending && u.t_last) t1 = Math.max(t1, u.t_last);
+  if (!isFinite(t0) || !isFinite(t1)) return '';
+  const span = Math.max(t1 - t0, 1);
+  const px = t => (t - t0) / span * 100;
+
+  // ---- 轮标签条(每轮居中一颗: R1·冷启动 47.7s) ----
+  const rlbl = (u.rounds || []).map(r => {
+    const a = px(r.t_start ?? t0), b = px(r.t_end ?? t1);
+    const kind = r.ongoing ? '进行中' : r.single_arm
+      ? `单臂${r.single_arm === 'armleft' ? 'A' : 'B'}` : r.cold ? '冷启动' : '稳态';
+    return `<span style="left:${(a + b) / 2}%"><b>R${r.round}</b>·${kind}` +
+      (r.ongoing ? '' : ` ${fmtDur(r.duration_s)}`) + '</span>';
+  }).join('');
+
+  // ---- 车道行 ----
+  const rows = [];
+  for (const [key, label, cls] of lanes) {
+    const bs = (blocks[key] || []).slice().sort((a, b) => a.t0 - b.t0);
+    if (!bs.length) continue;
+    let pickNo = 0, nUp = 0, nDn = 0, lastUp = -99, lastDn = -99;
+    const html = bs.map(b => {
+      const l = Math.max(0, px(b.t0));
+      const w = Math.min(100 - l, px(b.t1 ?? t1) - px(b.t0));
+      if (w <= 0.15) return '';
+      let nm = String(b.n || '');
+      if (nm === PICK_NAME) nm = '吸取' + circNo(++pickNo);
+      const dur = (b.t1 ?? t1) - b.t0;
+      const tipTxt = `${label} · ${nm}<br>${hms(b.t0)} ~ ${b.t1 ? hms(b.t1) : '进行中'}` +
+        `<br>${fmtDur(dur)}${b.wait ? ' (等待)' : ''}`;
+      let inner = (w >= 9 && nm.length <= 8) ? `<i>${esc(nm)}</i>` : '';
+      // 关键步放不进块内 → 上下交替小标注(同侧间距≥7%,避免叠字)
+      if (!inner && b.key && nm.length && w >= 0.8) {
+        const x = l + w / 2;
+        const up = nUp <= nDn;
+        if (up && x - lastUp >= 7) { lastUp = x; nUp++; }
+        else if (!up && x - lastDn >= 7) { lastDn = x; nDn++; }
+        else return '';
+        const tag = nm.length > 6 ? nm.slice(0, 6) + '…' : nm;
+        inner = `<span class="flg-tag ${up ? 'up' : 'dn'}" style="left:${x}%">${esc(tag)}</span>`;
+      }
+      return `<div class="flg-blk ${b.wait ? 'w' : cls}" style="left:${l}%;width:${w}%"` +
+        ` data-tip="${esc(tipTxt)}">${inner}</div>`;
+    }).join('');
+    rows.push(`<div class="flg-lane"><span class="flg-lname">${label}</span>` +
+      `<div class="flg-track">${html}</div></div>`);
+  }
+
+  // ---- 竖线层: 轮分界(实线,每轮起点+末轮终点) + FILLED(蓝虚线) ----
+  let lines = '';
+  const rs = u.rounds || [];
+  for (const r of rs) {
+    if (r.t_start != null) lines += `<i class="flg-rline" style="left:${px(r.t_start)}%"></i>`;
+  }
+  const lastEnd = rs.length ? rs[rs.length - 1].t_end : null;
+  if (lastEnd != null) lines += `<i class="flg-rline" style="left:${px(lastEnd)}%"></i>`;
+  let lastLbl = -99;
+  for (const t of (u.filled_ts || [])) {
+    if (t < t0 || t > t1) continue;
+    const x = px(t);
+    const lbl = (x - lastLbl >= 6) ? `<span>FILLED</span>` : '';
+    if (lbl) lastLbl = x;
+    lines += `<i class="flg-fline" style="left:${x}%">${lbl}</i>`;
+  }
+
+  // ---- 时间轴: 相对秒从 0 起,5s 一格(超长册自动放宽保可读;绝对时刻看块悬停) ----
+  const step = span <= 300 ? 5 : span <= 600 ? 10 : span <= 1200 ? 30 : 60;
+  const ticks = [];
+  for (let t = 0; t <= span + 0.01; t += step) {
+    ticks.push(`<i class="${t < 0.01 ? 'a' : ''}" style="left:${t / span * 100}%">` +
+      `${Math.round(t)}</i>`);
+  }
+
+  const done = (u.rounds || []).filter(r => !r.ongoing);
+  const cold = done.find(r => r.cold);
+  const steady = done.filter(r => !r.cold && !r.single_arm);
+  const lastSpd = (u.rounds || []).map(r => r.speed_txt).filter(Boolean).pop() || '';
+  const head = `<div class="flg-head"><b>第${u.session}次 · ${esc(u.tag || u.name)}` +
+    `${u.pending ? '(进行中)' : ''}</b>` +
+    `<span class="muted">${hms(t0)} ~ ${hms(t1)} · ${done.length}轮完成 · 全程 ${fmtDur(t1 - t0)}</span>` +
+    (cold ? `<span class="muted">冷启动 ${fmtDur(cold.duration_s)}</span>` : '') +
+    (steady.length ? `<span class="muted">稳态均 ${fmtDur(steady.reduce((s, r) => s + r.duration_s, 0) / steady.length)}</span>` : '') +
+    (lastSpd ? `<span class="muted">${esc(lastSpd)}</span>` : '') + '</div>';
+  return `<div class="flg">${head}` +
+    `<div class="flg-rounds">${rlbl}</div>` +
+    `<div class="flg-lanes">${rows.join('')}${lines}</div>` +
+    `<div class="flg-axis">${ticks.join('')}</div></div>`;
+}
+
+// ===================== 渲染整页 =====================
+let curRange = { start: '', end: '' };
+
+function render(rep) {
+  const box = $('rpBox');
+  const us = rep.runs || [];
+  if (!us.length) {
+    box.className = 'muted';
+    box.textContent = '该时间段无流水线记录(轮次=左臂吸放两摞+右臂夹完放完回归;只有带循环的正式运行才进报告)。';
+    return;
+  }
+  const s = rep.summary || {};
+  const tiles = [
+    ['冷启动 · 首轮完成', s.cold_s != null ? fmtDur(s.cold_s) : '-',
+     `启动→首轮 · 均值 ${fmtDur(s.cold_avg_s)}`],
+    ['稳态 · 轮周期', s.steady_avg_s != null ? fmtDur(s.steady_avg_s) : '-',
+     `冷启动后 · ${s.steady_rounds ?? 0} 轮`],
+    ['右臂 · 净夹放回归', s.right_work_avg_s != null ? fmtDur(s.right_work_avg_s) : '-',
+     'FILLED→夹完放完回归 · 均值'],
+    ['左臂 · 一轮(吸2次)', s.left_cycle_avg_s != null ? fmtDur(s.left_cycle_avg_s) : '-',
+     `共 ${s.rounds_total ?? 0} 轮 / ${s.sessions_total ?? 0} 次启动`],
+  ].map(([t, v, d]) => `<div class="tile"><b>${v}</b><span>${t}</span><br><span>${d}</span></div>`)
+    .join('');
+
+  const trs = (rep.rounds || []).map(r => {
+    const l = r.left || {}, rt = r.right || {}, c = r.cutter || {};
+    const kind = r.ongoing ? '进行中' : r.single_arm
+      ? `单臂${r.single_arm === 'armleft' ? 'A' : 'B'}` : r.cold ? '冷启动' : '稳态';
+    return `<tr><td>第${r.session ?? 1}次</td><td>第${r.round}轮</td><td>${kind}</td>` +
+      `<td>${r.start ? r.start.slice(-8) : '-'}</td><td>${r.end ? r.end.slice(-8) : '…'}</td>` +
+      `<td>${r.ongoing ? '-' : fmtDur(r.duration_s)}</td>` +
+      `<td>${l.cycle_s != null ? fmtDur(l.cycle_s) + (l.picks ? `(吸${l.picks})` : '') : '-'}</td>` +
+      `<td>${rt.wait_s != null ? fmtDur(rt.wait_s) : '-'}</td>` +
+      `<td>${rt.work_s != null ? fmtDur(rt.work_s) : '-'}</td>` +
+      `<td>${c.push1 != null ? fmtDur(c.push1) : '-'}</td>` +
+      `<td>${c.push2 != null ? fmtDur(c.push2) : '-'}</td>` +
+      `<td>${esc(r.speed_txt || '')}</td></tr>`;
+  }).join('');
+
+  box.className = '';
+  box.innerHTML = `<div class="flk">${tiles}</div>` +
+    `<div class="flg-legend"><span><s style="background:#3987e5"></s>左臂</span>` +
+    `<span><s style="background:#d95926"></s>右臂</span>` +
+    `<span><s style="background:#199e70"></s>裁剪机构(并行)</span>` +
+    `<span><s style="background:repeating-linear-gradient(45deg,#3a424c 0 4px,#2f353e 4px 8px)"></s>等待</span>` +
+    `<span style="color:#aab1bd">│ 轮分界</span>` +
+    `<span style="color:#8eb6ff">┆ FILLED(右臂放行)</span>` +
+    `<span class="muted">一次启动一行(不裁剪)·轮界=右臂收口·时间轴=相对秒(5s/格),绝对时刻悬停看</span></div>` +
+    us.map(ganttRun).join('') +
+    '<table class="flrpt"><thead><tr><th>次</th><th>轮次</th><th>性质</th>' +
+    '<th>开始</th><th>结束</th><th>轮周期</th><th>左臂(吸N)</th><th>右臂等待</th>' +
+    '<th>右臂净夹放回归</th><th>推①</th><th>推②</th><th>速度</th></tr></thead><tbody>' +
+    trs + '</tbody></table>';
+
+  const tip = tipWire();
+  box.querySelectorAll('.flg-blk[data-tip]').forEach(el => {
+    el.addEventListener('mousemove', e => {
+      tip.style.display = 'block';
+      tip.innerHTML = el.dataset.tip;
+      tip.style.left = Math.min(e.clientX + 14, innerWidth - tip.offsetWidth - 8) + 'px';
+      tip.style.top = (e.clientY + 14) + 'px';
+    });
+    el.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+  });
+}
+
+async function query(silent) {
+  const box = $('rpBox');
+  if (!silent) { box.className = 'muted'; box.textContent = '查询中…'; }
+  try {
+    const r = await fetch('/api/flow/logs/preview?start=' +
+      encodeURIComponent(curRange.start) + '&end=' + encodeURIComponent(curRange.end));
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.detail || r.statusText);
+    render(d);
+  } catch (e) {
+    if (!silent) { box.className = 'muted'; box.textContent = '查询失败: ' + e.message; }
+  }
+}
+
+// ---- 日志册选择(默认最新一册) ----
+async function loadRuns() {
+  let runs = window._rpRuns;
+  if (!runs) {
+    try {
+      const d = await fetch('/api/flow/logs').then(r => r.json());
+      runs = window._rpRuns = (d && d.runs) || [];
+    } catch (e) { runs = window._rpRuns = []; /* 选册失败也能手填时间 */ }
+  }
+  const sel = $('rpRun');
+  const dual = runs.filter(r => (r.arms || []).length >= 2 || /dual/.test(r.name));
+  const opt = dual.length ? dual : runs;      // 优先整线册
+  sel.innerHTML = '<option value="">— 按时间段 —</option>' + opt.map(r =>
+    `<option value="${esc(r.name)}">${esc((r.started || r.name).slice(5, 19))} ` +
+    `${esc((r.arms || []).join('+'))} · ${r.cycles || 0}循环</option>`).join('');
+  if (opt.length) { sel.selectedIndex = 1; fillRange(opt[0]); }
+}
+function fillRange(run) {
+  const toLocal = iso => (iso || '').slice(0, 19).replace(' ', 'T');
+  $('rpStart').value = toLocal(run.started);
+  $('rpEnd').value = toLocal(run.ended);
+  applyInputs();
+}
+function applyInputs() {
+  const v = el => el.value.trim().replace('T', ' ') || '';
+  curRange = { start: v($('rpStart')), end: v($('rpEnd')) };
+}
+$('rpRun').addEventListener('change', () => {
+  const run = ($('rpRun').value || '') &&
+    (window._rpRuns || []).find(r => r.name === $('rpRun').value);
+  if (run) fillRange(run);
+});
+(async () => {          // script 在 body 末尾,DOM 已就绪
+  await loadRuns();
+  await query(false);
+})();
+$('rpView').addEventListener('click', async () => {
+  $('rpRun').value = '';                      // 手动改时间=离开选册模式
+  applyInputs();
+  await query(false);
+});
+$('rpStart').addEventListener('change', () => { $('rpRun').value = ''; applyInputs(); });
+$('rpEnd').addEventListener('change', () => { $('rpRun').value = ''; applyInputs(); });
+$('rpExport').addEventListener('click', () => {
+  applyInputs();
+  const a = document.createElement('a');
+  a.href = '/api/flow/logs/export?start=' + encodeURIComponent(curRange.start) +
+           '&end=' + encodeURIComponent(curRange.end);
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+});
+setInterval(() => {
+  if ($('rpAuto').checked && document.visibilityState === 'visible') query(true);
+}, 5000);
+</script>
+</body>
+</html>

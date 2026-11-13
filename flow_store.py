@@ -140,7 +140,8 @@ DEFAULTS: dict = {
         },
     },
     # 三档闸门: verify=每轮测一次,达标即过(T1,默认);off=纯回放(T0,极限节拍,
-    # 靠事件兜底);修正量超 max_corr 视为工装被撞,停机报警。
+    # 靠事件兜底);startup=只在首个启用的闸门测一次,Δ 定标全臂(整机挪动
+    # 场景,见 flow.py 启动PBVS);修正量超 max_corr 视为工装被撞,停机报警。
     "gate": {
         "mode": "verify",
         "tol_xy_mm": 2.0,
@@ -168,6 +169,24 @@ DEFAULTS: dict = {
         # 再进中心,并持锁贯穿 A1→闸门→A2 —— 消除"左臂停在中间件上方
         # 观察位等料时,右臂 B1/B2 进中心取料"的双臂同区并行窗口。
         "center_serialize": False,
+    },
+    # 裁剪机构(2026-11-11 流水线3): Jetson ws_control.py 推杆+升降台,
+    # 替代原中间件。enabled=true 时左臂循环切到"两吸两放+两推(联动升降)"
+    # 编排,中心互斥整体停用(左臂工作区=左半边,右臂=右半边,物理不重叠)。
+    "cutter": {
+        "enabled": False,
+        "sim": False,             # true=不连真机纯模拟(写代码/演示用)
+        "ws_url": "ws://10.245.169.248:8765",
+        # 升降中间点圈数: 从最高点(上限位)下降到中间点的圈数,
+        # 与手动台 double_control_linux.py 按键4 的 N 同义(默认 11),
+        # 现场可用网页裁剪面板步进标定后填入。
+        "middle_revs": 11.0,
+        # 推杆速度 r/min: 随 push/cycle 指令下发(只写推杆驱动器,站1);
+        # 0=不带,用 Jetson 服务端默认 1200。升降腿恒走服务端默认 300
+        # (实测 >300 堵转,勿在此调升降)。服务端范围 10~3000。
+        "push_speed_rpm": 1000.0,
+        "push_timeout_s": 90.0,   # 推杆往返(含联动)完成超时
+        "lift_timeout_s": 60.0,   # 升降单程完成超时
     },
     "stats": {"cycles": 0},       # 流水线累计循环数
 }
@@ -362,8 +381,8 @@ def update_config(patch: dict) -> dict:
     cfg = load_config()
     if "gate" in patch:
         g = patch["gate"]
-        if g.get("mode") not in (None, "verify", "off"):
-            raise ValueError("gate.mode 只能是 verify/off")
+        if g.get("mode") not in (None, "verify", "off", "startup"):
+            raise ValueError("gate.mode 只能是 verify/off/startup")
         for k in ("tol_xy_mm", "tol_z_mm", "max_corr_mm", "reanchor_max_mm"):
             if k in g:
                 g[k] = float(min(max(float(g[k]), 0.0), 100.0))
@@ -391,6 +410,33 @@ def update_config(patch: dict) -> dict:
         if "center_serialize" in s:
             cfg.setdefault("safety", {})["center_serialize"] = bool(
                 s["center_serialize"])
+    if "cutter" in patch:
+        c = patch["cutter"] or {}
+        cur = cfg.setdefault("cutter", dict(DEFAULTS["cutter"]))
+        if "enabled" in c:
+            cur["enabled"] = bool(c["enabled"])
+        if "sim" in c:
+            cur["sim"] = bool(c["sim"])
+        if "ws_url" in c:
+            u = str(c["ws_url"]).strip()
+            if not (u.startswith("ws://") or u.startswith("wss://")):
+                raise ValueError("cutter.ws_url 必须以 ws:// 或 wss:// 开头")
+            cur["ws_url"] = u[:120]
+        if "middle_revs" in c:
+            v = float(c["middle_revs"])
+            if not 0.1 <= v <= 50.0:
+                raise ValueError("cutter.middle_revs 需在 0.1~50 圈"
+                                 "(最高点→中间点的下降圈数)")
+            cur["middle_revs"] = v
+        if "push_speed_rpm" in c:
+            v = float(c["push_speed_rpm"])
+            if not (v == 0 or 10.0 <= v <= 3000.0):
+                raise ValueError("cutter.push_speed_rpm 需为 0(=默认1200)"
+                                 "或 10~3000 r/min")
+            cur["push_speed_rpm"] = v
+        for k in ("push_timeout_s", "lift_timeout_s"):
+            if k in c:
+                cur[k] = float(min(max(float(c[k]), 5.0), 300.0))
     for arm in ARM_KEYS:
         p = patch.get(arm)
         if not p:
@@ -420,13 +466,19 @@ def update_config(patch: dict) -> dict:
         for vk in ("vacuum_grab", "vacuum_release"):
             if vk in p and slot.get(vk):
                 v = p[vk]
+                # mode 白名单: manual(手控窗口)/gripper(夹爪联动)/
+                # valve(电磁阀直控,11-13 已接硬件 —— flow.py::_set_vacuum_valve
+                # → CutterFlow.valve → Jetson ws "valve" 指令)
+                mode = v.get("mode", "manual")
                 slot[vk] = {
-                    "mode": v.get("mode", "manual") if v.get("mode") in
-                    ("manual", "gripper") else "manual",
+                    "mode": mode if mode in ("manual", "gripper", "valve")
+                    else "manual",
                     "gripper_position": float(v.get("gripper_position", 0)),
                     "gripper_velocity": max(500, float(v.get("gripper_velocity",
                                                              500))),
                 }
+                for kk in [k for k in v if k.startswith("valve_")]:
+                    slot[vk][kk] = v[kk]      # 电磁阀参数原样透传(接入后用)
         if "post_grippers" in p:
             pg_in = p["post_grippers"] or {}
             pg = slot.setdefault("post_grippers", {})
@@ -733,6 +785,27 @@ def readiness(cfg: dict | None = None, only: str | None = None) -> dict:
         warnings.append("双臂并行模式:左臂会停在中间件上方观察位等右臂"
                         "B1/B2 取料 —— 首次联调建议开 safety.center_serialize"
                         " 或用单步确认模式慢速验证")
+    # —— 裁剪机构方案(流水线3): Jetson ws 可达性/参数 ——
+    cc = cfg.get("cutter") or {}
+    if cc.get("enabled"):
+        if not (0.1 <= float(cc.get("middle_revs", 0) or 0) <= 50.0):
+            warnings.append("裁剪机构: 升降中间点圈数(middle_revs)未标定"
+                            " —— 用网页裁剪面板步进找中间点后填入")
+        if cc.get("sim"):
+            warnings.append("裁剪机构 SIM 模式: 不连真机,推/升降只记日志"
+                            " —— 仅调试用,正式跑前关掉")
+        else:
+            import cutter_client as _cc
+            try:
+                _cc.probe(str(cc.get("ws_url", "")), timeout=2.5)
+            except Exception as e:                           # noqa: BLE001
+                missing.append(f"裁剪机构 {e} —— 检查 Jetson"
+                               f"({cc.get('ws_url')}) 上 ws_control.py"
+                               " 是否在跑")
+        if only is None:
+            warnings.append("裁剪方案编排: 左臂每轮 视觉吸两摞→放裁剪放料区"
+                            "→两推(联动升降 中间点→最低→最高),右臂在最高点"
+                            "一次夹两摞入料仓;中心互斥已停用(左右半区)")
     return {"ok": not missing, "missing": missing, "warnings": warnings}
 
 

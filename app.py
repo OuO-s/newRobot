@@ -61,6 +61,8 @@ import flow_runlog
 import flow_store
 import resume_store
 import speed_store
+import cutter_client
+from cutter_client import CutterError
 from flow import (ArmLoop, FlowError, FlowRunner, fix_align_gate,
                   goto_align_ref, record_align_ref, test_align_gate)
 
@@ -2604,6 +2606,87 @@ def flow_config_set(body: dict):
             "readiness": flow_store.readiness(cfg)}
 
 
+# ── 裁剪机构(Jetson 推杆+升降台,流水线3)手动面板 ──────────────────
+class FlowCutterCmdBody(BaseModel):
+    cmd: str              # status/stop/lift_lowest/lift_middle/lift_highest/
+                          # lift_up_revs/lift_down_revs/push/push_lift_down/
+                          # push_lift_up
+    revs: float | None = None   # lift_*_revs 用的圈数(默认 1)
+
+
+_CUTTER_CMD_HELP = ("cmd 可选: status stop lift_lowest lift_middle "
+                    "lift_highest lift_up_revs lift_down_revs push "
+                    "push_lift_down push_lift_up valve_on valve_off")
+
+
+def _cutter_flow_of_active_cfg(log=None) -> cutter_client.CutterFlow:
+    cc = (flow_store.load_config().get("cutter") or {})
+    if not cc.get("enabled"):
+        raise _err("当前方案未启用裁剪机构(流水线3 才启用)", 400)
+    return cutter_client.CutterFlow(cc, log=log)
+
+
+@app.get("/api/flow/cutter/status")
+def flow_cutter_status():
+    """连通检查(hello+status,不动机构)—— 面板『查状态』。"""
+    try:
+        flow = _cutter_flow_of_active_cfg()
+        return {"ok": True, "sim": flow.sim, "url": flow.url,
+                "status": flow.status()}
+    except HTTPException:
+        raise
+    except CutterError as e:
+        raise _err(str(e), 502)
+
+
+@app.post("/api/flow/cutter/cmd")
+def flow_cutter_cmd(body: FlowCutterCmdBody):
+    """手动驱动裁剪机构(标定中间点/单步联调)。运动类命令流水线运行中拒绝;
+    全部阻塞到 Jetson 回 done(ok=false 会 4xx 并带每条腿的停法)。"""
+    if body.cmd not in ("status", "stop", "lift_lowest", "lift_middle",
+                        "lift_highest", "lift_up_revs", "lift_down_revs",
+                        "push", "push_lift_down", "push_lift_up",
+                        "valve_on", "valve_off"):
+        raise _err(_CUTTER_CMD_HELP, 400)
+    if body.cmd not in ("status", "stop"):
+        _flow_guard_moving()
+    flow = _cutter_flow_of_active_cfg()
+    try:
+        if body.cmd == "status":
+            out = flow.status()
+        elif body.cmd == "stop":
+            out = flow.stop()
+        elif body.cmd == "lift_lowest":
+            out = flow.lift_lowest()
+        elif body.cmd == "lift_middle":
+            out = flow.lift_middle()
+        elif body.cmd == "lift_highest":
+            out = flow.lift_highest()
+        elif body.cmd in ("lift_up_revs", "lift_down_revs"):
+            revs = float(body.revs or 1.0)
+            if not 0.1 <= revs <= 50.0:
+                raise _err("revs 需在 0.1~50 圈", 400)
+            out = flow.lift_revs("up" if body.cmd == "lift_up_revs"
+                                 else "down", revs)
+        elif body.cmd in ("valve_on", "valve_off"):
+            # 吸盘电磁阀(11-13 接硬件): 即时指令不受 busy 门禁,
+            # 但流水线运行中阀归编排管,手动只许停线时用
+            out = flow.valve(body.cmd == "valve_on")
+        elif body.cmd == "push":
+            out = flow.push_cycle(None)
+        elif body.cmd == "push_lift_down":
+            out = flow.push_cycle("down")
+        else:                                   # push_lift_up
+            out = flow.push_cycle("up")
+    except HTTPException:
+        raise
+    except CutterError as e:
+        raise _err(f"裁剪机构: {e}", 502)
+    finally:
+        flow.close()
+    return {"ok": bool(out.get("ok", True)), "cmd": body.cmd, "done": out}
+
+
 @app.post("/api/flow/teach/waypoint")
 def flow_teach_waypoint(body: FlowArmActionBody):
     """把当前关节角+末端位姿追加为该动作的下一个路点(不动臂)。"""
@@ -2911,9 +2994,11 @@ def flow_logs_list():
 
 @app.get("/api/flow/logs/preview")
 def flow_logs_preview(start: str = "", end: str = ""):
-    """客户视图运行报告(按时间段聚合,默认当天): 轮次列表 + A/B 大步
-    起止耗时 + 汇总(总轮数/总时间/平均每轮)。流水线在跑时末轮可显示
-    为进行中。start/end 支持 YYYY-MM-DD 或 YYYY-MM-DD HH:MM[:SS]。"""
+    """客户视图运行报告(独立页 /report,按时间段聚合): 按册分组 runs
+    (一次启动=整程甘特一行,各臂+机构全部步不裁剪+FILLED 时刻)+ 轮次
+    节拍(一轮=左臂吸放两摞+右臂夹完放完回归;第1轮=冷启动·启动→首轮
+    完成)+ 汇总(冷启动/稳态轮周期/右臂净夹放回归)。流水线在跑时末轮可
+    显示为进行中。start/end 支持 YYYY-MM-DD 或 YYYY-MM-DD HH:MM[:SS]。"""
     try:
         return flow_runlog.aggregate_report(
             start, end, active=_flow_running())
@@ -2923,8 +3008,9 @@ def flow_logs_preview(start: str = "", end: str = ""):
 
 @app.get("/api/flow/logs/export")
 def flow_logs_export(start: str = "", end: str = ""):
-    """运行报告导出 CSV(与预览同口径: 时间段聚合 A/B 大步 + 每轮小计 +
-    总计;UTF-8 BOM,Excel 直开)。start/end 参数同 preview。"""
+    """运行报告导出 CSV(与预览同口径: 一行一轮 = 轮周期/左右臂分解
+    (等待·净工作)/机构步/速度 + 总计;UTF-8 BOM,Excel 直开)。
+    start/end 参数同 preview。"""
     try:
         csv_text, filename = flow_runlog.export_report_csv(
             start, end, active=_flow_running())
@@ -3000,4 +3086,10 @@ if _STATIC.is_dir():
     @app.get("/")
     def index():
         return FileResponse(str(_STATIC / "index.html"),
+                            headers={"Cache-Control": "no-cache"})
+
+    @app.get("/report")
+    def report_page():
+        """运行报告独立页(第9 Tab『📈 运行报告』按钮 window.open 跳转)。"""
+        return FileResponse(str(_STATIC / "report.html"),
                             headers={"Cache-Control": "no-cache"})

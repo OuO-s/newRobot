@@ -43,6 +43,27 @@
     没有这一步,按示教关节角回放会把闸门修正"弹回"示教点,
     视觉校准等于白做。|Δ锚| < move.reanchor_min_mm 时退回关节回放。
 
+  - 启动PBVS(gate.mode="startup",2026-11-09): 只在流程首个启用的
+    闸门测一次(左右臂各测各的),收敛 Δ 立即重解成"平移后的关节"
+    固化到本次运行(内存,不落盘),此后全部动作·全部轮次按平移关节
+    回放,过程中的闸门一律跳过 —— 整机挪动/工装整体平移场景,
+    一套示教一次找回。单站独立漂移不适用(用默认 verify 逐站修);
+    左臂扫描吸取(scan_and_pick)自带视觉,不参与平移。
+
+  - 裁剪机构方案(cfg.cutter.enabled,2026-11-11 流水线3): 中间件换成
+    Jetson 裁剪机构(推杆+升降台,ws_control.py,cutter_client.py)。
+    左臂每轮两吸两放两推: A1吸取位到位→自动视觉吸①→A2放料正上方
+    (下降放料走示教路点)→(等右臂取走上轮两摞=EMPTY)→升降从最高点降
+    middle_revs 圈到中间点→推杆联动1[异步,去程剪切①·回程升降到最低;
+    同时本臂回去吸②]→等推回→A2放②→推杆联动2(剪切②·回程升降升到
+    最高)→置 FILLED。A1=吸取位(到位即自动吸取,scan_and_pick
+    from_current,不回放扫描/悬停位);A2=放料正上方(末点=对准观察位,
+    闸门在 A2 段后,startup 首轮定标)。右臂循环编排不变: 等 FILLED→
+    B1→B2 在最高点一次夹两摞→置 EMPTY→B3→B4入仓。
+    左右工作区物理分离 → 中心互斥整体停用(●中点标记失效,⏱等待仍生效);
+    启动时升降回零(升上限位钉停)一次,此后每轮第2推联动升限位自动重对齐。
+    异常停线时给裁剪机构发全停(stop);软停则让当前动作自然走完。
+
 用户只需要在网页上"添加动作"(记录路点)和"记录对准参考",
 本文件不接触任何具体点位。
 
@@ -63,6 +84,7 @@ import flow_runlog
 import flow_store
 import pick_store
 import speed_store
+from cutter_client import CutterAborted, CutterError, CutterFlow
 from cartesian import cartesian_delta_move, plan_cartesian_path
 from depth_provider import DepthError, DepthSession, ensure_ros_env
 from flow_align import MarkerFinder, measure_marker_base
@@ -145,6 +167,13 @@ class Handoff:
         self.center_wp_level = False      # 锁=路点级(中点标记)还是整段级
         self._runner = runner
 
+    @property
+    def center_enabled(self) -> bool:
+        """中心互斥总开关。裁剪机构方案(cfg.cutter.enabled)左右臂工作区
+        物理分离(左半边/右半边,2026-11-11 流水线3),中心锁整体停用 ——
+        enter/wait 直接放行,路点"中点"标记随之失效(不抢不交)。"""
+        return not bool((self._runner.cfg.get("cutter") or {}).get("enabled"))
+
     def set_filled(self, by: str):
         with self._cond:
             self.fixture = "FILLED"
@@ -168,6 +197,8 @@ class Handoff:
                 self._cond.wait(timeout=0.5)
 
     def enter_center(self, loop: "ArmLoop", wp_level: bool = False):
+        if not self.center_enabled:            # 裁剪方案: 半区分离,无中心锁
+            return
         if self.center_owner == loop.arm:      # 已自持(center_serialize 的
             return                             # A1),防自等死锁
         with self._cond:
@@ -181,6 +212,8 @@ class Handoff:
         self._runner.runlog.event("handoff", loop.arm, center="acquire")
 
     def wait_center_free(self, loop: "ArmLoop"):
+        if not self.center_enabled:            # 裁剪方案: 直接放行
+            return
         with self._cond:
             while self.center_owner is not None:
                 if self._runner.abort_event.is_set():
@@ -214,10 +247,19 @@ class ArmLoop:
         self.phase_times: dict[str, float] = {}     # 各步最近一次耗时
         self._phase_t0 = time.time()
         self._cycle_t0 = None
+        self.last_cycle_rec: dict | None = None   # 最近一次 cycle 事件(轮次汇总)
         # 重锚回放状态(见模块头): _taught_end_pos = 刚回放动作的示教
         # 末点(基座系),_gate_offset = 闸门收敛后的平移量(reanchor 动作消费)
         self._taught_end_pos: list | None = None
         self._gate_offset: np.ndarray | None = None
+        # 启动PBVS(gate.mode=startup): 首个启用的闸门收敛后 Δ 定标,
+        # 全臂动作路点平移重解成关节存 _shifted_wps(仅本次运行);
+        # _startup_delta 非 None(含 Δ≈0)即后续闸门全跳过
+        self._startup_delta: np.ndarray | None = None
+        self._shifted_wps: dict[str, list] | None = None
+        # 启动模式实测的基座系码位移 d=p_now−p_ref(比 Δ锚干净,见
+        # _latch_startup_delta 的说明);每次闸门测量都会刷新
+        self._startup_meas_d: np.ndarray | None = None
         # 本轮循环的日志累积(循环起点重置,_mark_cycle 汇总落盘)
         self._cycle_phases: list[list] = []        # [[phase, 耗时s], ...]
         self._cycle_actions: list[dict] = []
@@ -234,8 +276,10 @@ class ArmLoop:
 
     def set_phase(self, phase: str):
         now = time.time()
-        if self.phase and self.phase != phase:
-            dur = round(now - self._phase_t0, 2)
+        if self.phase == phase:
+            return            # 同相位重入(wait_fixture 0.5s 轮询)不改
+        if self.phase:        # 起点 —— 否则长等待只记末次 0.5s,等待时长
+            dur = round(now - self._phase_t0, 2)   # 被漏记(11-12 实跑踩过)
             self.phase_times[self.phase] = dur
             if self._cycle_t0 is not None:
                 self._cycle_phases.append([self.phase, dur])
@@ -326,13 +370,20 @@ class ArmLoop:
     def _mv_cfg(self) -> dict:
         return self.runner.cfg["move"]
 
-    def play_action(self, name: str, reanchor: bool = False):
+    def play_action(self, name: str, reanchor: bool = False,
+                    wp_range=None):
         """示教动作回放: 关节路点序列 + 段后验证补走 + 中途真空触发。
 
         动作配置 vacuum = {"event": "grab"|"release", "at": "start"|k|"end"},
         k=路点序号: 到第 k 个路点后触发(下降到位再断/开真空,然后走完剩余)。
         路点 wait_s=到点等待: 到该点(段后验证补走之后)先等 N 秒再走剩余段;
         真空触发点同点配了等待时,顺序=到点→等待→触发真空。
+
+        wp_range=(a, b)=只回放第 a+1..b 个路点(b=None=到末点),用于动作
+        中途分段(2026-11-12 裁剪流水线: 第2摞吸完先走到 A2 点2 等推杆
+        回位,再走剩余下降放料段)。真空触发号按整动作绝对路点号解读,
+        不落在本段的自动不触发;"end"只在末段、"start"只在首段生效;
+        该段路点为空时静默跳过(不动挂起的闸门Δ,后续段还要用)。
 
         reanchor=True(闸门后的 A2/B2/B4 用): 若紧前的对准闸门留有平移
         Δ锚,各路点示教位姿 +Δ锚 后按笛卡尔逐点走,让视觉修正传导进
@@ -349,11 +400,28 @@ class ArmLoop:
             self.runner.runlog.event("action_skip", self.arm, action=name,
                                      reason="no_waypoints")
             return
+        shifted = (self._shifted_wps or {}).get(name)
+        if shifted is not None:
+            # 启动PBVS: 换成平移后的关节路点;回放/补走/等待/中点锁/
+            # 真空时序机制全部不变 —— 仍是关节轨迹,只是刚体平移过
+            wps = shifted
+        base, tail = 0, True
+        if wp_range is not None:
+            a, b = wp_range
+            base = int(a)
+            wps = wps[base:] if b is None else wps[base:int(b)]
+            tail = b is None
+            if not wps:
+                # 分段为空: 静默跳过 —— 不作废挂起的闸门Δ(它属整个
+                # 动作,后续段仍要用;区别于"整动作无路点"的作废)
+                self.say(f"{name}: 路点区间[{a}:{b if b is not None else '末'}]"
+                         "为空,跳过分段")
+                return
         if (meta.get("wait") == "center_free"
                 and self.runner.handoff.center_owner != self.arm):
             # 自己已持锁(center_serialize 的 A1)时不再等 —— 防自等死锁
             self.runner.handoff.wait_center_free(self)
-        if not reanchor:
+        if not reanchor and self._shifted_wps is None:
             self._gate_offset = None            # 绝对回放: 挂起的修正作废
         # 动作级覆盖极少用;缺省=顶栏全局速度(每动作取一次,改了即时生效)
         speed = act.get("speed") or speed_store.get_speed(self.arm)
@@ -380,18 +448,27 @@ class ArmLoop:
         rec = {"action": name, "cycle": self.cycles + 1,
                "t_start": flow_runlog.iso(), "speed_pct": speed,
                "waypoints": len(wps),
+               "wp_range": (list(wp_range) if wp_range is not None else None),
                "mode": "reanchor" if off is not None else "joint",
+               "startup_shift_mm": ([round(float(v) * 1000.0, 2)
+                                     for v in self._startup_delta]
+                                    if shifted is not None else None),
                "vacuum": vac, "pose_start": self._pose_snap()}
         try:
             cut = len(wps) - 1                   # 真空触发前走到的路点
             if vac:
                 at = vac.get("at", "end")
+                # 分段回放(wp_range)时 at 按整动作绝对路点号解读:
+                # 不落在本段的(含 end 遇非末段/start 遇非首段)不在此触发
                 if at == "start":
-                    cut = -1
+                    cut = -1 if base == 0 else len(wps)
                 elif at == "end":
-                    cut = len(wps) - 1
+                    cut = (len(wps) - 1) if tail else len(wps)
                 else:
-                    cut = min(max(int(at), 0), len(wps) - 1)
+                    k = int(at)
+                    cut = k - base if base <= k < base + len(wps) \
+                        else len(wps)
+            fire = vac is not None and cut <= len(wps) - 1
 
             def _seg(wlist):
                 """按路点"中点"标记分段走并管中心锁: 走向中点前抢锁,
@@ -422,6 +499,9 @@ class ArmLoop:
                             self.runner._sleep_abort(float(ws))
                         k = m + 1
 
+                if not hand.center_enabled:
+                    run(0, len(wlist))     # 裁剪方案: 中心锁停用,整段直走
+                    return                 # (●中点标记失效,⏱等待仍生效)
                 i, n = 0, len(wlist)
                 while i < n:
                     if hand.center_owner == self.arm and \
@@ -448,7 +528,7 @@ class ArmLoop:
 
             if cut >= 0:
                 _seg(wps[:cut + 1])
-            if vac:
+            if fire:
                 self.runner.vacuum(self, vac["event"])
             if cut < len(wps) - 1:
                 _seg(wps[cut + 1:] if cut >= 0 else wps)
@@ -650,6 +730,10 @@ class ArmLoop:
     def align_gate(self, which: str = "align") -> dict:
         """三档对准闸门。which: align(中间件) / align2(料仓,仅右臂)。"""
         gate = self.runner.cfg["gate"]
+        if gate.get("mode") == "startup":
+            # 启动模式一次定标,PnP 的 z 噪声会原样进 Δ 影响全程:
+            # 帧数至少 9(verify 逐站修可以容忍抖,一次性定标不行)
+            gate = {**gate, "frames": max(int(gate["frames"]), 9)}
         self._gate_offset = None                 # 每次闸门重置,成功才留 Δ锚
         slot = self.runner.cfg["arms"][self.arm].get(which) or {}
         where = "中间件" if which == "align" else "料仓"
@@ -748,6 +832,13 @@ class ArmLoop:
                                     T_from(ep["position"], ep["orientation"]),
                                     T_x, frames=int(gate["frames"]))
             d = np.array(m["p_base"]) - np.array(ref["p_base"])
+            if gate["mode"] == "startup":
+                # 启动PBVS钉住"实测码位移"(基座系):比 Δ锚(当前末端−
+                # 示教末点,含回放残余+T2 修正)更干净 —— 新鲜回放的
+                # 残余在平移后的回放里同样会出现,算进 Δ 等于重复计入
+                # (11-13 流水线2实测: 应用端 0.0~0.01° 精确,残差全在
+                # Δ 估计本身)
+                self._startup_meas_d = np.asarray(d, float).copy()
             dxy = float(np.hypot(d[0], d[1])) * 1000
             dz = float(abs(d[2])) * 1000
             key_ok = m["key"] == ref.get("key")
@@ -912,7 +1003,7 @@ class ArmLoop:
                          f"{dxy:.1f}/{dz:.1f}mm) —— 停线。{hint}")
 
     # ------------------------------------------------------------ 左臂: 视觉吸取
-    def scan_and_pick(self):
+    def scan_and_pick(self, from_current: bool = False):
         """物料检测 + 吸取 —— 与『物料检测』页一步到位同款行为:
         ①回放扫描位→YOLO+深度定位 ②③按 pick 配置 motion_mode 二选一:
         direct=一键直达(扫描位→aim 一段直线,不可达退分段走廊)/
@@ -920,16 +1011,24 @@ class ArmLoop:
         ④下压(沿工具系 Z+/吸嘴轴向) ⑤真空/保持沿用 pick 配置,
         吸完即止(不抬升,A1 回放直接接管)。
         每个子步独立 phase(scan/pick_hover/…/pick_grab):
-        运行徽章、单步确认与 phase_times 都按子步呈现,不再笼统一个"pick"。"""
+        运行徽章、单步确认与 phase_times 都按子步呈现,不再笼统一个"pick"。
+        from_current=True(流水线3 裁剪方案): A1 吸取位到位后调用 ——
+        不回放扫描位/悬停位,稳一稳直接从当前位姿(A1 末点)取帧检测,
+        A1 末点本身就是吸取悬停几何,后续对准/下压照常。"""
         pcfg = pick_store.load_config()
-        if not pcfg.get("scan_pose"):
+        if not from_current and not pcfg.get("scan_pose"):
             raise ValueError("左臂扫描位未示教 —— 请在『物料检测』页"
                              "『存当前为扫描位』")
         # ① 物料检测: 回扫描位 → 取帧 → YOLO → 深度 → 基座系点位 → 分层排序
         self.set_phase("scan")
-        self.say("① 物料检测: 回扫描位 → 取帧 → YOLO+深度 → 基座系定位")
+        if from_current:
+            self.say("① 物料检测: 从当前位(A1 吸取位)取帧 → YOLO+深度"
+                     " → 基座系定位")
+            time.sleep(pcfg.get("settle_s", 0.5))   # A1 到位后稳一稳再取帧
+        else:
+            self.say("① 物料检测: 回扫描位 → 取帧 → YOLO+深度 → 基座系定位")
         out = scan_once(self.robot, self.runner.pick_adapter, pcfg,
-                        replay=True, say=self.say)
+                        replay=not from_current, say=self.say)
         rows = out["rows"]
         if not rows:
             raise ValueError("物料检测未发现可吸取目标 —— 请补料,"
@@ -939,8 +1038,9 @@ class ArmLoop:
         # 料仓在工作空间边缘时二者不可兼得(2026-11-09 扫描位→袋的笛卡尔
         # IK 解分支翻转被 45° 护栏拒)。悬停位示教于袋上方·同解枝,
         # 关节回放无跳解,后续小行程笛卡尔下探从这里出发。
+        # (from_current 时跳过: A1 末点就是示教的吸取位,不再另回悬停位)
         hover_pose = pcfg.get("hover_pose")
-        if hover_pose:
+        if hover_pose and not from_current:
             self.set_phase("pick_hovermove")
             self.say(f"①+ 关节回放悬停位"
                      f"({hover_pose.get('created', '?')} 示教)")
@@ -1040,9 +1140,66 @@ class ArmLoop:
     # ------------------------------------------------------------ 循环体
     def _loop(self):
         if self.arm == "armleft":
-            self._loop_left()
+            if self.runner.cutter_on():
+                self._loop_left_cutter()
+            else:
+                self._loop_left()
         else:
-            self._loop_right()
+            self._loop_right()          # 裁剪方案下仅中心锁自动失效,
+                                        # 编排不变: 等 FILLED→B1→B2夹→
+                                        # EMPTY→B3→B4(±B0/B5)
+
+    def _end_of_cycle(self, note: str) -> bool:
+        """循环收尾共法: 轮次/单臂测试判定,True=应停止循环。"""
+        if self.single_shot:
+            if self.cycles >= (self.max_cycles or 1):
+                self.say(f"◎ 单臂测试: {self.cycles} 个循环完成,自动停止"
+                         f"({note})")
+                return True
+            return False
+        if self.max_cycles and self.cycles >= self.max_cycles:
+            self.say(f"◎ 已跑满 {self.max_cycles} 轮,自动停止({note})")
+            return True
+        return False
+
+    def _cutter_aborted(self, fn, *a, **kw):
+        """裁剪动作包装: 软停期间的等待中断转 _Abort(不算失败),
+        其余 CutterError 原样上抛 → 停线。"""
+        try:
+            return fn(*a, **kw)
+        except CutterAborted:
+            raise _Abort() from None
+
+    def _spawn(self, fn, name):
+        """起后台线程(裁剪编排的并行机构步,守护线程随进程退出)。
+        本地测试把它替换成同步执行,时序断言才是确定的。"""
+        threading.Thread(target=fn, daemon=True, name=name).start()
+
+    def _wait_evt(self, evt, err_box=None):
+        """等 threading.Event(0.2s 步进,软停可断);err_box 带错则上抛。
+        主线程与后台机构线程共用同一等待语义。"""
+        while not evt.is_set():
+            self.check_abort()
+            evt.wait(0.2)
+        if err_box is not None and "err" in err_box:
+            raise err_box["err"]
+
+    def _cut_step(self, step: str, t0: float, *, cycle: int | None = None,
+                  ok: bool = True, err: str | None = None):
+        """裁剪机构步落 jsonl(kind=cutter,独立并行车道) + runner 环形账本
+        (轮次汇总取数用)。机构步与臂动作并行,不挂臂名(arm=None)。"""
+        t1 = time.time()
+        rec = {"step": step, "cycle": self.cycles + 1 if cycle is None
+               else cycle, "t0": t0, "t1": t1,
+               "dur": round(t1 - t0, 3), "ok": ok, "err": err}
+        try:
+            self.runner._cut_steps.append(rec)
+        except Exception:                                      # noqa: BLE001
+            pass
+        self.runner.runlog.event(
+            "cutter", None, step=step, cycle=rec["cycle"],
+            t_start=flow_runlog.iso(t0), t_end=flow_runlog.iso(t1),
+            duration_s=rec["dur"], ok=ok, error=err)
 
     def _has_center_marks(self, names) -> bool:
         """相关动作任一路点带"中点"标记 → 中心互斥走路点级(标记段
@@ -1052,16 +1209,171 @@ class ArmLoop:
         return any(bool(w.get("center"))
                    for nm in names for w in acts[nm]["waypoints"])
 
+    def _latch_startup_delta(self):
+        """启动PBVS定标(gate.mode=startup): 流程首个启用的闸门收敛后,
+        把 Δ锚 固化为本轮全程修正 —— 本臂所有非空动作的各路点
+        end_pose+Δ 后以"该点示教关节"为起点重解 IK(同分支,45°跳解
+        护栏照常),得到平移后的关节角;此后所有轮次按平移关节回放
+        (回放/补走/等待/中点锁/真空时序全不变),过程中的闸门全跳过。
+
+        适用前提: 偏差来源是整机挪动/工装整体平移(所有站同一 Δ)。
+        单站独立漂移(只挪了一个工装)不适用 —— 用默认 verify 逐站修。
+        Δ 来源优先用闸门实测的码位移 d(基座系,见 align_gate 里的
+        _startup_meas_d),没有才退回 Δ锚;每个重解结果再用 FK 复核
+        (平移后末端位移 vs Δ,残差>0.5mm=IK 解走了别的分支,停线)。
+        重解失败(不可达/跳解)= 该点位偏移后到不了,立即停线: 此时臂
+        还在观察位,安全;提示减小挪动量或重示教该动作。"""
+        off = (self._startup_meas_d if self._startup_meas_d is not None
+               else self._gate_offset)
+        self._gate_offset = None
+        self._startup_delta = np.zeros(3)
+        self._shifted_wps = {}
+        if off is None:
+            self.say("启动PBVS: 闸门通过但无 Δ(未取到测量值),"
+                     "后续按原示教回放")
+            return
+        mm = float(np.linalg.norm(off)) * 1000.0
+        if mm < float(self._mv_cfg()["reanchor_min_mm"]):
+            self.say(f"启动PBVS: Δ {mm:.2f}mm < "
+                     f"{self._mv_cfg()['reanchor_min_mm']}mm 死区,"
+                     "后续按原示教回放")
+            return
+        acts = self.runner.cfg["arms"][self.arm]["actions"]
+        shifted, report, max_fk = {}, [], 0.0
+        for name in flow_store.ACTIONS_META[self.arm]:
+            wps = acts[name]["waypoints"]
+            if not wps:
+                continue
+            new = []
+            for i, w in enumerate(wps):
+                ep = w.get("end_pose") or {}
+                if not ep.get("position") or not ep.get("orientation"):
+                    raise ValueError(
+                        f"启动PBVS: {name} 点{i + 1} 缺 end_pose ——"
+                        " 重新示教一遍该动作即可补全")
+                tgt = [float(ep["position"][k]) + float(off[k])
+                       for k in range(3)]
+                try:
+                    out = plan_cartesian_path(
+                        self.arm, [float(v) for v in w["joints_deg"]],
+                        op="target", target_pos_m=tgt,
+                        target_rpy_deg=quat_to_rpy_deg(
+                            [float(v) for v in ep["orientation"]]),
+                        cur_pos_m=[float(v) for v in ep["position"]],
+                        cur_quat=[float(v) for v in ep["orientation"]])
+                    sol = (out.get("waypoints_deg") or [None])[-1]
+                    if sol is None:
+                        raise RobotError("逆解未返回轨迹")
+                    # FK 复核: 平移后关节的末端位移应恰为 Δ(URDF 系。
+                    # 上报系与 URDF 系只差固定纯平移安装偏移,平移量在
+                    # 两系相等)。残差大 = IK 落到了别的分支/姿态变了,
+                    # 照走会偏 —— 直接停线
+                    fk0 = plan_cartesian_path(
+                        self.arm, [float(v) for v in w["joints_deg"]],
+                        op="fk")
+                    fk1 = plan_cartesian_path(
+                        self.arm, [float(v) for v in sol], op="fk")
+                    rd = (np.array(fk1["pos_m"], float)
+                          - np.array(fk0["pos_m"], float))
+                    resid_mm = float(
+                        np.linalg.norm(rd - np.asarray(off, float))) * 1000.0
+                    if resid_mm > 0.5:
+                        dmm = np.round(np.asarray(off, float) * 1000.0, 1)
+                        raise ValueError(
+                            f"启动PBVS: {name} 点{i + 1} 重解后 FK 复核残差 "
+                            f"{resid_mm:.2f}mm(≠Δ {dmm.tolist()}mm) —— "
+                            "IK 走了不同分支,减小挪动量或重示教该动作")
+                    max_fk = max(max_fk, resid_mm)
+                except RobotError as e:
+                    msg = str(e)
+                    if ("几乎一致" in msg or "无需运动" in msg
+                            or "near-zero trajectory" in msg):
+                        new.append(dict(w))   # 低于运动分辨率: 关节不变
+                        continue
+                    raise ValueError(
+                        f"启动PBVS: {name} 点{i + 1} 平移 "
+                        f"{np.round(off * 1000.0, 1).tolist()}mm 后重解失败"
+                        f"({msg}) —— 该点位偏移后不可达或跳解,"
+                        "减小挪动量或重示教该动作") from e
+                nw = dict(w)
+                nw["joints_deg"] = [float(v) for v in sol]
+                nw["end_pose"] = {"position": tgt,
+                                  "orientation": list(ep["orientation"])}
+                new.append(nw)
+            shifted[name] = new
+            dj = max(max(abs(a - b) for a, b in zip(n["joints_deg"],
+                                                    o["joints_deg"]))
+                     for n, o in zip(new, wps))
+            report.append((name, dj))
+        self._startup_delta = np.asarray(off, float)
+        self._shifted_wps = shifted
+        src = "实测码位移" if self._startup_meas_d is not None else "Δ锚"
+        self.say(f"启动PBVS: ✓ 定标 Δ={np.round(off * 1000.0, 1).tolist()}mm"
+                 f"({src}),{len(shifted)} 个动作路点已平移"
+                 f"(FK 复核最大残差 {max_fk:.2f}mm;各动作关节最大变化 "
+                 + ", ".join(f"{n} {d:.1f}°" for n, d in report)
+                 + "),本轮及后续轮次不再闸门")
+        self.runner.runlog.event(
+            "startup_fix", self.arm,
+            delta_mm=[round(float(v) * 1000.0, 2) for v in off],
+            delta_src=src, fk_resid_mm=round(max_fk, 3),
+            actions={n: round(float(d), 2) for n, d in report})
+
     def _gate_or_skip(self, obs_action: str, which: str, where: str):
         """段后对准闸门: 观察位动作有路点才测(Δ 锚在观察位末点上,
         动作空=无观察位,测出的 Δ 是幻影,绝不能修);空则跳过并提示,
-        后续 reanchor 回放自然退纯关节。"""
+        后续 reanchor 回放自然退纯关节。
+        gate.mode=startup: 流程首个真测了的闸门=启动PBVS,通过即把 Δ
+        定标到全臂(见 _latch_startup_delta),此后所有闸门全跳过。"""
+        if (self.runner.cfg["gate"].get("mode") == "startup"
+                and self._shifted_wps is not None):
+            if self._shifted_wps:
+                self.say(f"闸门[{where}]: 跳过 —— 启动PBVS已定标"
+                         f"(Δ={np.round(self._startup_delta * 1000.0, 1).tolist()}"
+                         "mm 已应用于全部动作与轮次)")
+            else:
+                self.say(f"闸门[{where}]: 跳过 —— 启动PBVS未定标"
+                         "(该臂 PBVS 停用或无参考),按原示教回放")
+            self.runner.runlog.event("gate_skip", self.arm, which=which,
+                                     reason="startup_done" if self._shifted_wps
+                                     else "startup_nocal")
+            return
         if self.runner.cfg["arms"][self.arm]["actions"][obs_action]["waypoints"]:
-            self.align_gate(which)
+            res = self.align_gate(which)
+            if (self.runner.cfg["gate"].get("mode") == "startup"
+                    and res.get("tier") in ("T1", "T2")):
+                self._latch_startup_delta()
         else:
             self.say(f"{obs_action} 空: 跳过{where}对准(无观察位)")
             self.runner.runlog.event("gate_skip", self.arm, which=which,
                                      reason=f"{obs_action}_empty")
+
+    def _startup_pbvs(self, obs_action: str, which: str, where: str):
+        """启动PBVS(流水线3 右臂专用入口): 调用方须已把臂停在观察位
+        (右臂=就位 B2 点1 后、等 FILLED 之前 —— 裁剪还在切,测量零等待)。
+        仅 gate.mode=startup 且尚未定标时测一次并定标到全臂;verify/off
+        模式静默不测(裁剪方案原本就没有过程右臂闸门,维持原行为)。
+        PBVS 停用/无参考: 置空定标标记,后续闸门按 startup_nocal 跳过,
+        本轮按原示教回放 —— 不拦线,靠就绪检查与 UI 提示兜底。"""
+        if (self.runner.cfg["gate"].get("mode") != "startup"
+                or self._shifted_wps is not None):
+            return
+        slot = self.runner.cfg["arms"][self.arm].get(which) or {}
+        if not slot.get("enabled", True):
+            self.say(f"启动PBVS[{where}]: 该臂 PBVS 已停用 —— "
+                     "本轮按原示教回放(要修正在『PBVS 参考』卡勾选启用)")
+            self._shifted_wps = {}          # 空=已处理不惦记(见 _gate_or_skip)
+            self.runner.runlog.event("gate_skip", self.arm, which=which,
+                                     reason="startup_disabled")
+            return
+        if not slot.get("ref"):
+            self.say(f"启动PBVS[{where}]: 未记录参考 —— 本轮按原示教回放"
+                     "(要修正请先在『PBVS 参考』卡记录)")
+            self._shifted_wps = {}
+            self.runner.runlog.event("gate_skip", self.arm, which=which,
+                                     reason="startup_noref")
+            return
+        self._gate_or_skip(obs_action, which, where)
 
     def _release_center_or_warn(self, name: str):
         """中心段收尾: 仍持锁(示教末点还是中点,没教退出点)则提前
@@ -1116,6 +1428,180 @@ class ArmLoop:
                 self.say(f"◎ 已跑满 {self.max_cycles} 轮,自动停止")
                 return
 
+    def _loop_left_cutter(self):
+        """裁剪机构版左臂循环(流水线3;2026-11-12 二次重排=左右臂完全
+        独立,机构步全部并行化,左臂只在 A2 点2 等推杆):
+
+        每轮 = 【轮首后台线程: (等上轮推②完成→)等右臂清空(EMPTY)→
+        升降到中间点】‖ A1 吸取位 → 自动视觉吸取第1摞 → A2 到点2 →(等
+        上一轮推②把托盘让出来)→ 断真空放第1摞 →【后台线程: 等升降到
+        中间(通常早已到)→ 推①】‖ 同时 A1 吸第2摞 → A2 回点2 等推①回位
+        (到点时已回=直接放)→ 断真空放第2摞 → 推②(联动升)异步发出
+        【完成线程自动置 FILLED】→ 左臂不等,立刻进下一轮吸取。
+
+        - 左臂全程不等右臂/令牌(单臂测试也不等): 唯一的等待=在 A2 点2
+          等推杆回位 —— 现场已确认推杆扫过点2 不会碰到吸嘴,到位等是安全的。
+        - 升降降中间点在轮首就发(与吸第1摞并行): 首轮也不晚拍 —— 此前
+          排在"放完第1摞"后,首次启动时臂都到 A2 点2 了升降才开始降
+          (11-12 复盘问题②;稳态因 EMPTY 等待叠在吸料下而看不出来)。
+        - 推①的完整门禁 = 第1摞已放好 + 升降已在中间 + 右臂已清空,
+          由 _push1 线程等 lift_done 事件保证,Jetson 不会被 busy 拒。
+        - 右臂只看 FILLED(=推②完成+升降到最高),等令牌期间预先就位
+          B2 点1(见 _loop_right)。
+        A1=吸取位(到位即自动视觉吸取);A2 点2=等待位=释放位(现 2 点
+        示教: 接近/放料位;≥3 点示教时 [2:] 段=下降/释放/抬起,真空按
+        绝对路点号在段内触发,2 点示教由循环显式断真空)。闸门观察位=
+        点2,startup 首轮定标。中心互斥整体停用。"""
+        cut = self.runner.cutter                # CutterFlow(真机/SIM)
+        ab = self.runner.abort_event.is_set     # 软停感知(裁剪等待可中断)
+        hand = self.runner.handoff
+        note = self.runner.note
+        a2act = self.runner.cfg["arms"][self.arm]["actions"]["A2_place"]
+
+        class _Quiet:
+            """后台线程的 wait_fixture 替身: 不抢左臂相位显示。"""
+            def set_phase(self, phase):
+                pass
+
+        home_done = False
+        # 上一轮推②的完成状态(fin2 线程置位): 放下1摞前等托盘让位。
+        # 注意不能用句柄直接 wait —— fin2 已把句柄收走,再 wait 会报
+        # "不存在或已收尾"(15:07 实跑踩过)
+        p2_done, p2_box = None, None
+        while True:
+            self.check_abort()
+            self._cycle_t0 = time.time()
+            self._cycle_phases, self._cycle_actions, self._cycle_gates = \
+                [], [], []
+            self.post_grip("start")
+            if not home_done:
+                # 启动回零(每次运行仅一次): 保证"从最高点降 N 圈=中间点"
+                # 的基准成立 —— 之后每轮推②联动升到上限位自动重对齐
+                self.set_phase("cutter_home")
+                self.say("裁剪: 启动回零 —— 升降升到最高(撞上限位钉停)")
+                t0 = time.time()
+                try:
+                    self._cutter_aborted(cut.lift_home_top, abort_cb=ab)
+                except BaseException as e:      # 计时先于上抛: 失败也要留痕
+                    self._cut_step("lift_home", t0, ok=False, err=str(e))
+                    raise
+                self._cut_step("lift_home", t0)
+                home_done = True
+            a2_simple = len(a2act["waypoints"]) <= 2   # 点2=释放位(现场确认)
+            # ── 轮首就发升降线程: [等上轮推②完成→]右臂清空(EMPTY)→降到
+            # 中间点 —— 与吸第1摞完全并行。11-12 复盘: 首轮曾把这一步排在
+            # "放完第1摞"之后,臂都到 A2 点2 了升降还在最高点才开始降;
+            # 提前到轮首后,臂到点时升降已在中间点(稳态本来就有此并行)。
+            prev_done, prev_box = p2_done, p2_box
+            lift_done, lift_box = threading.Event(), {}
+
+            def _lift_mid():
+                try:
+                    if prev_done is not None:
+                        self._wait_evt(prev_done, prev_box)
+                    if not self.single_shot:
+                        hand.wait_fixture("EMPTY", _Quiet())
+                    note("裁剪: 升降到中间点(第1摞接料高度)"
+                         "—— 与吸取并行,放好第1摞即推①")
+                    t0 = time.time()
+                    try:
+                        self._cutter_aborted(cut.lift_middle, abort_cb=ab)
+                    except BaseException as e:
+                        self._cut_step("lift_mid", t0, ok=False, err=str(e))
+                        raise
+                    self._cut_step("lift_mid", t0)
+                except BaseException as e:
+                    lift_box["err"] = e
+                finally:
+                    lift_done.set()
+            self._spawn(_lift_mid, f"cutter-liftmid-{self.cycles + 1}")
+            # ── 第 1 摞: 吸取 → A2 点2 →(等上轮推②让位)→ 放 ──
+            self.play_action("A1_transfer")            # A1=吸取位
+            self.scan_and_pick(from_current=True)      # 到位后自动视觉吸取
+            self.post_grip("A1_transfer")
+            self.play_action("A2_place", wp_range=(0, 2))   # 到点2等/放
+            if prev_done is not None:
+                self.set_phase("cutter_wait_push2")
+                self.say("裁剪: 等上一轮推②回位(托盘让位)再放第1摞"
+                         "(通常吸料途中已完成,到点即过)")
+                self._wait_evt(prev_done, prev_box)   # 推②失败=托盘没让位
+            self._gate_or_skip("A2_place", "align", "裁剪放料区")
+            if a2_simple:
+                self.say("A2 点2 到位,断真空放第1摞")
+                self.runner.vacuum(self, "release")
+            # ── 放好①摞 → 发推①线程: 等升降到中间(通常早已到)即推 ──
+            pbox, armed = {}, threading.Event()
+
+            def _push1():
+                try:
+                    self._wait_evt(lift_done, lift_box)  # 升降失败在这里抛
+                    note("裁剪: 第1摞已放、升降在中间点 —— 推①")
+                    t0 = time.time()             # 受理即计时(排队等待不算)
+                    pbox["tok"] = self._cutter_aborted(
+                        cut.begin_push_cycle, "down", abort_cb=ab)
+                    pbox["t0"] = t0
+                except BaseException as e:        # 软停/机构故障: 交给主线程
+                    pbox["err"] = e
+                finally:
+                    armed.set()
+            self._spawn(_push1, f"cutter-push1-{self.cycles + 1}")
+            self.play_action("A2_place", reanchor=True, wp_range=(2, None))
+            # ── 第 2 摞: 吸取(与升降/推①并行)→ A2 点2 等推杆回位 → 放 ──
+            self.play_action("A1_transfer")
+            self.scan_and_pick(from_current=True)
+            self.post_grip("A1_transfer")
+            self.play_action("A2_place", wp_range=(0, 2))   # 回点2等推杆
+            self.set_phase("cutter_wait_push1")
+            self._wait_evt(armed, pbox)          # 推①可能尚未发出(右臂未清)
+            self.say("裁剪: 等推①回位(回位=升降已在最低)再放第2摞"
+                     "(到点时已回=直接放)")
+            try:                                 # 回位=推①机构段收口,落时
+                self._cutter_aborted(cut.wait, pbox["tok"], abort_cb=ab)
+                self._cut_step("push1", pbox.get("t0", time.time()))
+            except BaseException as e:
+                if pbox.get("t0") is not None:
+                    self._cut_step("push1", pbox["t0"], ok=False, err=str(e))
+                raise
+            self._gate_or_skip("A2_place", "align", "裁剪放料区")
+            if a2_simple:
+                self.say("A2 点2 到位,断真空放第2摞")
+                self.runner.vacuum(self, "release")
+            self.play_action("A2_place", reanchor=True, wp_range=(2, None))
+            # ── 推②(联动升)异步: 完成线程置 FILLED,左臂不等立刻下一轮 ──
+            cyc = self.cycles + 1            # 轮号在受理时定格(fin2 异步收口)
+            t2 = time.time()
+            try:
+                tok = self._cutter_aborted(cut.begin_push_cycle, "up",
+                                           abort_cb=ab)
+            except BaseException as e:       # 受理即失败: 同步留痕后停线
+                self._cut_step("push2", t2, cycle=cyc, ok=False, err=str(e))
+                raise
+            p2_done, p2_box = threading.Event(), {}
+
+            def _fin2():
+                try:
+                    self._cutter_aborted(cut.wait, tok, abort_cb=ab)
+                    self._cut_step("push2", t2, cycle=cyc)
+                    hand.set_filled("armleft")
+                except BaseException as e:   # 软停/故障: 下一轮托盘让位
+                    self._cut_step("push2", t2, cycle=cyc, ok=False,
+                                   err=str(e))
+                    p2_box["err"] = e        # 等待处会 raise,不会带病叠放
+                finally:
+                    p2_done.set()
+            self._spawn(_fin2, f"cutter-fin2-{self.cycles + 1}")
+            self.say(f"裁剪: 第{self.cycles + 1}轮推②已发(去程剪切·"
+                     "回程升降到最高,完成自动置 FILLED)"
+                     " —— 左臂不等,继续吸下一摞")
+            self.post_grip("A2_place")
+            self.cycles += 1
+            self._mark_cycle()
+            if self._end_of_cycle(
+                    f"第{self.cycles}轮两摞已放好、推②升降中,"
+                    "单臂模式完成后请人工取走" if self.single_shot else
+                    f"第{self.cycles}轮两摞已放好,推②完成后右臂自动取"):
+                return
+
     def post_grip(self, slot: str):
         """动作间夹爪整形(通用): 槽位=某动作名或 "start"(循环首步前),
         该动作完成后把夹爪调到配置的开合目标值并等待 wait_s
@@ -1147,7 +1633,24 @@ class ArmLoop:
                     self.say("待命: 等中间件首件(左臂放完置 FILLED)后"
                              "B1 进中心取料 —— 启动时中间件为空,"
                              "右臂首轮无活属正常(流水线灌入)")
+                # 裁剪方案(流水线3): 等令牌期间先把整段接近行程走掉,
+                # 就位 B2 点1(夹取接近位)—— 令牌一到直接进夹取段,
+                # 不再"待命中→FILLED→从远端整段走来"(2026-11-12 视频
+                # 复盘③: 视频里右臂全程远端待命,白串整段接近时间)。
+                # 就位即启动PBVS定标(startup 模式首轮一次): 人就位/
+                # 裁剪在切的这段空闲正好用来测码+重解全程路点,零节拍代价
+                if self.runner.cutter is not None and self.runner.cfg[
+                        "arms"][self.arm]["actions"]["B2_pick"]["waypoints"]:
+                    self.play_action("B2_pick", wp_range=(0, 1))
+                    self.say("右臂: 已就位 B2 点1,先启动PBVS定标"
+                             "再等裁剪完成(FILLED)")
+                    self._startup_pbvs("B2_pick", "align", "裁剪取料位")
                 self.runner.handoff.wait_fixture("FILLED", self)
+            elif self.runner.cutter is not None and self.runner.cfg[
+                    "arms"][self.arm]["actions"]["B2_pick"]["waypoints"]:
+                # 单臂右测(裁剪): 同样先就位 B2 点1 做启动PBVS定标
+                self.play_action("B2_pick", wp_range=(0, 1))
+                self._startup_pbvs("B2_pick", "align", "裁剪取料位")
             wp_center = self._has_center_marks(
                 ("B1_approach", "B2_pick"))
             # B3 首点也标了 ●中点 → 锁不在 B2 末原位交,带着走过夹爪整形
@@ -1163,7 +1666,14 @@ class ArmLoop:
             try:
                 self.play_action("B1_approach")
                 self.post_grip("B1_approach")
-                self._gate_or_skip("B1_approach", "align", "中间件")
+                if self.runner.cutter_on():
+                    # 裁剪方案: 右臂 PBVS 只有取料位一处(启动时已定标),
+                    # B1/料仓两处过程闸门不在本流程中
+                    self.runner.runlog.event(
+                        "gate_skip", self.arm, which="align",
+                        reason="cutter_single_pbvs")
+                else:
+                    self._gate_or_skip("B1_approach", "align", "中间件")
                 self.play_action("B2_pick", reanchor=True)    # 闸门Δ传导
                 if wp_center and not b3_holds:
                     self._release_center_or_warn("B2_pick")
@@ -1174,7 +1684,12 @@ class ArmLoop:
             self.post_grip("B2_pick")              # 可选:B2→B3 夹爪整形
             self.play_action("B3_transfer")
             self.post_grip("B3_transfer")
-            self._gate_or_skip("B3_transfer", "align2", "料仓")
+            if self.runner.cutter_on():
+                self.runner.runlog.event(
+                    "gate_skip", self.arm, which="align2",
+                    reason="cutter_single_pbvs")
+            else:
+                self._gate_or_skip("B3_transfer", "align2", "料仓")
             self.play_action("B4_place", reanchor=True)       # 闸门Δ传导
             self.post_grip("B4_place")
             # B5 附加动作(可选): B4 后·循环末前,空路点=整段跳过(同 B0)。
@@ -1201,6 +1716,18 @@ class ArmLoop:
         dt = time.time() - self._cycle_t0
         self.cycle_ts.append(dt)
         del self.cycle_ts[:-20]
+        # 令牌等待/净工作分解(轮次节拍口径,右臂最常用):
+        #   wait_s = 全部 wait_*(令牌/中心锁)相位合计;
+        #   work_s = 末个 wait_* 之后的相位合计 —— 右臂即"FILLED 到手
+        #   → 夹完放完回归"的净时长(就位段在等待前,不算);
+        #   picks = 本循环视觉吸取次数(流水线3 左臂=2)。
+        wait_s = sum(d for p, d in self._cycle_phases
+                     if str(p).startswith("wait_"))
+        work_s = 0.0
+        for p, d in reversed(self._cycle_phases):
+            if str(p).startswith("wait_"):
+                break
+            work_s += d
         # 本轮实际下发过的速度(每动作取一次全局值):顶栏中途改速/动作级
         # 覆盖都会体现为多值,如 [30, 50] → "30→50%"
         used = sorted({a.get("speed_pct") for a in self._cycle_actions
@@ -1211,6 +1738,9 @@ class ArmLoop:
                "t_start": flow_runlog.iso(self._cycle_t0),
                "t_end": flow_runlog.iso(),
                "duration_s": round(dt, 3),
+               "wait_s": round(wait_s, 1),
+               "work_s": round(work_s, 1),
+               "picks": sum(1 for p, _ in self._cycle_phases if p == "scan"),
                "avg_recent_s": round(float(np.mean(self.cycle_ts)), 3),
                "speed_pct": speed_store.get_speed(self.arm),
                "speeds_used": used,
@@ -1221,6 +1751,8 @@ class ArmLoop:
                  f"(近均值 {np.mean(self.cycle_ts):.1f}s,"
                  f"speed {spd_txt})")
         self.runner.runlog.event("cycle", self.arm, **rec)
+        self.last_cycle_rec = rec
+        self.runner._on_cycle_done(self)   # 双臂都到 N → 轮次事件(见下)
 
     def status(self) -> dict:
         return {
@@ -1234,6 +1766,24 @@ class ArmLoop:
             "phase_times": self.phase_times,
             "log": list(self.log)[-40:],
         }
+
+
+def _set_vacuum_valve(runner, on: bool, vac: dict):
+    """左臂吸盘电磁阀 —— **2026-11-13 硬件已接,实装**。
+
+    链路: Jetson ws:8765 "valve" 指令 → /ssd/control/dist/valve_min.py
+    (USB-485 @9600 BESTEP 双路继电器)→ AirTAC 4V210-08 单电控阀。
+    通电=吸,断电=放(物料自由落体)。经 CutterFlow.valve() 走裁剪
+    机构现成 ws 通道,即时执行不受 busy 门禁(推杆动作期间也要能放料)。
+    参数: valve_port(C/U,默认C)、valve_timeout_s 随 vacuum_grab/
+    vacuum_release 配置透传(update_config 已放行 valve_*)。
+    失败抛错停线: 该吸没吸=带不动料,该放没放=物料挂在吸嘴上撞机构。"""
+    cutter = getattr(runner, "cutter", None)
+    if cutter is None:
+        raise ValueError(
+            "电磁阀需要裁剪机构通道(cutter 未启用) —— 勾选"
+            "「启用裁剪编排」或把真空模式改回 manual")
+    cutter.valve(on, str(vac.get("valve_port", "C")))
 
 
 # ===========================================================================
@@ -1260,6 +1810,16 @@ class FlowRunner:
         self.arms: dict[str, ArmLoop] = {}
         self.pick_adapter = None
         self.cfg: dict = {}
+        self.cutter: CutterFlow | None = None   # 裁剪方案启用时构建
+        # 轮次口径(2026-11-12,流水线3): 一整轮 = 左臂吸放两摞 + 右臂夹完
+        # 放完回归位置;轮完成 = 两臂 cycle#N 都收口(右臂是节拍尾部)。
+        # 轮 N 起点 = 上一轮完成时刻(第 1 轮 = 启动)→ duration 即
+        # "启动→首轮完成"(冷启动)与之后的稳态轮周期。
+        self.round_stats: list[dict] = []       # 每轮一条(网页/日志共用)
+        self._rounds_done = 0
+        self._round_prev_end: float | None = None
+        self._cut_steps: deque = deque(maxlen=80)   # 机构步账本(轮次取数)
+        self._round_lock = threading.Lock()
 
     # ------------------------------------------------------------ 生命周期
     def start(self, robot: TianlianRobot, *, step_mode: bool = False,
@@ -1286,10 +1846,20 @@ class FlowRunner:
 
         self.robot = robot
         self.cfg = cfg
+        # 裁剪机构方案: 构建客户端(懒连接,SIM=sim 不连真机);
+        # 左臂循环切 _loop_left_cutter,中心互斥整体停用
+        self.cutter = None
+        if bool((cfg.get("cutter") or {}).get("enabled")):
+            self.cutter = CutterFlow(cfg.get("cutter") or {}, log=self.note)
+            self.note(f"裁剪机构已接入: {self.cutter.url}"
+                      + (" [SIM]" if self.cutter.sim else ""))
         self.step_mode = bool(step_mode)
         self.rounds = rounds
         self.abort_event.clear()
         self._failed = None
+        self.round_stats, self._rounds_done = [], 0
+        self._round_prev_end = None
+        self._cut_steps.clear()
         self.runlog = flow_runlog.RunLogger(
             tag={"armleft": "left", "armright": "right"}.get(only_arm,
                                                              "dual"))
@@ -1309,6 +1879,10 @@ class FlowRunner:
                 pass
             self.runlog = flow_runlog.NullLogger()
             raise
+
+    def cutter_on(self) -> bool:
+        """裁剪机构方案(本臂循环编排分支/中心锁旁路都看它)。"""
+        return bool((self.cfg.get("cutter") or {}).get("enabled"))
 
     def _start_arms(self, cfg: dict, robot, only_arm, step_mode: bool):
         self.handoff = Handoff(self)
@@ -1377,6 +1951,79 @@ class FlowRunner:
             t.join()
         self._finish()
 
+    # ------------------------------------------------------------ 轮次口径
+    def _on_cycle_done(self, loop: "ArmLoop"):
+        """某臂收口一个循环后调: 双臂都到第 N 个 → 第 N 轮完成,落轮次
+        事件。统计失败绝不影响流水线(全吞)。"""
+        try:
+            if len(self.arms) < 2 or loop.single_shot:
+                return                 # 单臂测试/未双臂: 无"轮"概念
+            with self._round_lock:
+                n = min(a.cycles for a in self.arms.values())
+                while self._rounds_done < n:
+                    self._rounds_done += 1
+                    self._emit_round()
+        except Exception:                                          # noqa: BLE001
+            pass
+
+    def _emit_round(self):
+        """第 self._rounds_done 轮完成: 起止/分解落 jsonl(kind=round)+网页。
+        分解 = 左臂(吸N次)/右臂(等FILLED·净夹放回归)/机构步(推①②·升降),
+        全部取自两臂 last_cycle_rec 与 _cut_steps(按轮号对账)。"""
+        n = self._rounds_done
+        t_end = time.time()
+        t_start = self._round_prev_end or (self._run_t0 or t_end)
+        dur = t_end - t_start
+        arms = {}
+        for a, lp in self.arms.items():
+            c = lp.last_cycle_rec or {}
+            if c.get("cycle") == n:
+                arms[a] = {k: c.get(k) for k in
+                           ("duration_s", "wait_s", "work_s", "picks",
+                            "speeds_used")}
+        cut: dict[str, float] = {}
+        for s in self._cut_steps:    # 同轮同名步只留首现(每轮各一次)
+            if s.get("cycle") == n and s["step"] not in cut:
+                cut[s["step"]] = s.get("dur")
+        rec = {"round": n, "cold": n == 1,
+               "t_start": flow_runlog.iso(t_start),
+               "t_end": flow_runlog.iso(t_end),
+               "duration_s": round(dur, 1),
+               "arms": arms, "cutter": cut}
+        self._round_prev_end = t_end
+        self.round_stats.append(rec)
+        self.runlog.event("round", None, **rec)
+        f = lambda v: f"{v:.1f}s" if isinstance(v, (int, float)) else "?"  # noqa: E731
+        l, r = arms.get("armleft") or {}, arms.get("armright") or {}
+        msg = (f"◎ 第{n}轮完成: "
+               + (f"冷启动(启动→首轮完成) {dur:.1f}s" if n == 1
+                  else f"轮周期 {dur:.1f}s"))
+        if r:
+            msg += f" | 右臂净夹放回归 {f(r.get('work_s'))}"
+            if r.get("wait_s") is not None:
+                msg += f"(等FILLED {f(r['wait_s'])})"
+        if l:
+            msg += (f" | 左臂 {f(l.get('duration_s'))}"
+                    f"(吸{l.get('picks')}次"
+                    + (f",等待{f(l['wait_s'])}" if l.get("wait_s") else "")
+                    + ")")
+        for step in ("push2", "push1", "lift_mid"):
+            if cut.get(step) is not None:
+                msg += f" | { {'push2': '推②', 'push1': '推①', 'lift_mid': '升降'}[step] } {f(cut[step])}"
+        self.note(msg)
+
+    def _rounds_brief(self) -> dict | None:
+        """status() 用的轮次摘要: 完成/冷启动/稳态均值/最近一轮。"""
+        if not self.round_stats:
+            return None
+        steady = [r["duration_s"] for r in self.round_stats[1:]]
+        return {"done": self._rounds_done,
+                "first_s": self.round_stats[0].get("duration_s"),
+                "last_s": self.round_stats[-1].get("duration_s"),
+                "avg_steady_s": round(sum(steady) / len(steady), 1)
+                if steady else None,
+                "last": self.round_stats[-1]}
+
     def stop(self) -> dict:
         if not self._running:
             return {"ok": True, "note": "流水线未在运行"}
@@ -1393,6 +2040,11 @@ class FlowRunner:
             return
         self._running = False
         self._threads = []
+        if self.cutter is not None:
+            try:
+                self.cutter.close()         # 断开 ws(不动机构,动作已收尾)
+            except Exception:                       # noqa: BLE001
+                pass
         try:
             self.cameras.shutdown()
         except Exception:                           # noqa: BLE001
@@ -1417,6 +2069,17 @@ class FlowRunner:
         self._step_confirmed.set()
         self.note(f"‼ 异常停线: {why}")
         self.runlog.event("abort", None, why=why)
+        # 裁剪机构: 异常停线时后台全停(推杆/升降随时可停,下次动作前
+        # 服务端自动清急停);失败不让它拖着走完
+        if self.cutter is not None:
+            threading.Thread(target=self._cutter_safe_stop, daemon=True,
+                             name="cutter-estop").start()
+
+    def _cutter_safe_stop(self):
+        try:
+            self.cutter.stop()
+        except Exception:                               # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------ 单步确认
     def _step_gate(self, arm: ArmLoop):
@@ -1440,7 +2103,10 @@ class FlowRunner:
     def vacuum(self, arm: ArmLoop, event: str, vac: dict | None = None,
                hold_s: float | None = None):
         """event: grab/release。vac 缺省时取该臂配置(左臂吸取传 pick 配置)。
-        gripper 模式=联动夹爪通道;manual=人工窗口(等 hold 秒)。
+        gripper 模式=联动夹爪通道;valve=电磁阀直控(11-13 已接硬件,经
+    Jetson ws 即时指令,不受推杆 busy 门禁);
+        manual=人工窗口(等 hold 秒) —— 左臂吸盘现为人手控,grab/release
+        都走 manual,到点留出人工开关真空的时间窗(2026-11-12 现场确认)。
         hold_s 显式传入时覆盖闸门默认(吸取步沿用 pick 配置的 hold_s)。"""
         gate = self.cfg["gate"]
         hold = (float(hold_s) if hold_s is not None else
@@ -1451,7 +2117,11 @@ class FlowRunner:
             vac = (slot.get("vacuum_grab") if event == "grab"
                    else slot.get("vacuum_release")) or {"mode": "manual"}
         m0 = time.monotonic()
-        if vac.get("mode") == "gripper":
+        if vac.get("mode") == "valve":
+            _set_vacuum_valve(self, event == "grab", vac)
+            arm.say(f"真空{event}(电磁阀 {'通' if event == 'grab' else '断'})")
+            self._sleep_abort(hold)
+        elif vac.get("mode") == "gripper":
             try:
                 self.robot.set_gripper(
                     arm.side, float(vac.get("gripper_position", 0)),
@@ -1497,6 +2167,9 @@ class FlowRunner:
             "waiting_step": dict(self._step_label) or None,
             "fixture": self.handoff.fixture,
             "center_owner": self.handoff.center_owner,
+            "cutter": ({"url": self.cutter.url, "sim": self.cutter.sim}
+                       if self.cutter is not None else None),
+            "rounds": self._rounds_brief(),
             "arms": {a: self.arms[a].status() for a in self.arms},
             "log": list(self.log)[-30:],
         }

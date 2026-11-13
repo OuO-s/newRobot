@@ -392,6 +392,7 @@
             <select id="pkVacuum">
               <option value="manual">手动(外部)</option>
               <option value="gripper">联动夹爪</option>
+              <option value="valve">电磁阀(自动,经裁剪机构 Jetson)</option>
             </select>
           </label>
           <button id="pkSaveCfg">💾 保存设置</button>
@@ -546,11 +547,44 @@
       </div>
 
       <div class="card">
+        <h3>✂️ 裁剪机构(推杆+升降台 · Jetson websocket,流水线3)</h3>
+        <div class="row">
+          <label title="勾上=本方案用裁剪机构替代中间件:左臂每轮 视觉吸两摞→放裁剪放料区→两推(联动升降),右臂在最高点一次夹两摞入料仓;左右工作区分离,中心互斥自动停用。改完对下次启动生效"><input type="checkbox" id="flCutEn" /> 启用裁剪编排</label>
+          <label title="勾上=不连真机,推/升降只记日志(写代码/演示用),正式跑前必须关掉"><input type="checkbox" id="flCutSim" /> SIM 模式</label>
+          <label>Jetson ws 地址 <input id="flCutUrl" type="text" size="26" placeholder="ws://10.245.169.248:8765" /></label>
+          <label title="升降从最高点(上限位)下降到中间点的圈数,与手动台 double_control_linux.py 按键4 的 N 同义;用下面的步进按钮找中间点后填入">中间点圈数 <input id="flCutMid" type="number" min="0.1" max="50" step="0.1" value="11" size="4" /></label>
+          <label title="推杆速度 r/min,随推/联动指令下发(只写推杆驱动器);0=用 Jetson 默认1200。升降腿恒 300(>300 堵转),不在此调">推速 <input id="flCutSpd" type="number" min="0" max="3000" step="10" value="1000" size="4" /> r/min</label>
+          <button id="flCutSave" class="primary">💾 保存</button>
+          <button id="flCutProbe">🔎 查状态</button>
+        </div>
+        <div class="row" style="margin-top:6px;">
+          <b>手动联调(真动机构):</b>
+          <button id="flCutTop">⬆ 升到最高</button>
+          <button id="flCutLow">⬇ 降到最低</button>
+          <label title="步进标定中间点用: 升/降指定圈数(走脉冲自然停)">步进 <input id="flCutRevs" type="number" min="0.1" max="50" step="0.1" value="1" size="3" /> 圈</label>
+          <button id="flCutUpN">升 N 圈</button>
+          <button id="flCutDnN">降 N 圈</button>
+          <button id="flCutMidGo">↡ 到中间点</button>
+          <span class="muted">|</span>
+          <button id="flCutPush">↔ 推杆往返</button>
+          <button id="flCutPushD" title="推去剪切 → 回程同时升降降到最低(手动台按键7 联动1)">⑦ 联动·回程降</button>
+          <button id="flCutPushU" title="推去剪切 → 回程同时升降升到最高(手动台按键8 联动2)">⑧ 联动·回程升</button>
+          <span class="muted">|</span>
+          <button id="flCutValveOn" title="吸盘电磁阀通电(吸)—— 验接线/手动吸取用;走 Jetson 继电器,不动机器人">🔌 吸盘阀·通电</button>
+          <button id="flCutValveOff" title="吸盘电磁阀断电(放,物料自由落体)">⚡ 吸盘阀·断电</button>
+          <button id="flCutStop" class="danger">⏹ 全停</button>
+        </div>
+        <pre id="flCutOut" class="muted" style="margin:6px 0 0;white-space:pre-wrap;font-size:12px;max-height:160px;overflow-y:auto;border:1px dashed #456;border-radius:4px;padding:4px 8px;">裁剪机构状态/手动结果。启用裁剪编排后的自动时序:
+吸①→A1→A2放料区→(等右臂取走上轮)→升降降N圈到中间点→推①联动降[同时吸②回放料区上方等]→等推回→放②→推②联动升(两摞到最高点)→右臂一次夹两摞入仓。标定中间点: ⓪升到最高 → ⓪降N圈步进到接料高度 → 把累计圈数填进"中间点圈数"保存。</pre>
+      </div>
+
+      <div class="card">
         <h3>PBVS 对准(自动插在动作之间)与参数</h3>
         <div class="row">
           <label>模式
             <select id="flGateMode">
               <option value="verify">T1 每轮测一次(默认,~0.3s)</option>
+              <option value="startup">启动测一次,Δ应用于全程(挪机器人场景)</option>
               <option value="off">T0 纯回放(极限节拍,盲放)</option>
             </select>
           </label>
@@ -569,22 +603,17 @@
           (效果同 T0 但只影响这一站),就绪检查会提示;⚡单步验证也会要求先启用。</p>
       </div>
 
-      <div class="card">
-        <h3>🦾 左臂:视觉吸料 → 放中间件</h3>
-        <p class="muted">
-          吸料部分<b>全由视觉自动执行</b>(与『物料检测』页一步到位同款:参数、吸真空方式
-          沿用其设置;扫描位也在该页示教)。每轮循环执行顺序:<br>
-          <b>① 物料检测(自动:回扫描位 → YOLO+深度 → 基座系定位选袋)
-          → ② 移动到物料上方(自动:升越顶 → 转对准姿态 → 水平平移)
-          → ③ 下降+下压(自动:降到袋面,沿吸嘴轴向压入)
-          → ④ 吸取(手动:保持窗口内接真空)
-          → ⑤ 垂直抬升(自动) → A1(示教) → PBVS对准(自动) → A2(示教)</b>。<br>
-          你只需示教 A1 / A2(加上『物料检测』页的扫描位)。
-        </p>
-        <div id="flActsLeft"></div>
-        <h4 style="margin-top:10px;">中间件 PBVS 参考(左臂视角的码)</h4>
+      <div class="card" id="flPBVSCard">
+        <h3>PBVS 参考(每臂一处)</h3>
+        <p class="muted"><b>流水线3(裁剪)</b>:启动时先校准一次 —— 左右臂各自到观察位测一次,
+          Δ 立即平移该臂全部示教点位,<b>本轮所有动作·所有轮次都带修正,过程中不再测</b>;
+          勾掉『启用』=该臂完全不做 PBVS。<b>经典流程(流水线1/2)</b>:每轮到观察位各测各的。
+          观察位: 左臂 = 流水线3 的 <b>A2 点2(放料区)</b>/经典 A1 末点(中间件);
+          右臂 = 流水线3 的 <b>B2 点1(取料就位位)</b>/经典 B1 末点(中间件)。
+          记录参考 = 手动把该臂移到观察位(码在画面中央)再点"记录"。</p>
+        <h4 id="flPBVSLTitle">🦾 左臂 PBVS</h4>
         <div class="row">
-          <label title="停用=该站跳过 PBVS 对准:按示教关节回放,不测码不修正(只影响这一站;改完对下次启动生效,运行中的流水线不变)"><input type="checkbox" id="flEnL" checked /> 启用 PBVS 对准</label>
+          <label title="停用=该臂不做 PBVS:按示教关节回放,不测码不修正(改完对下次启动生效,运行中的流水线不变)"><input type="checkbox" id="flEnL" checked /> 启用 PBVS</label>
           <label>码类型
             <select id="flLMkType">
               <option value="aruco">ArUco</option>
@@ -600,33 +629,12 @@
           <button id="flGotoL">🧲 回观察位并测(动臂)</button>
           <button id="flFixL">⚡ 回观察位并修正(动臂·单步验 PBVS)</button>
         </div>
-        <div id="flRefInfoL" class="muted">未记录。把左臂移到 A1 末点(观察位,码在画面中央)再记录。</div>
+        <div id="flRefInfoL" class="muted">未记录。把左臂移到观察位(码在画面中央)再记录。</div>
         <img id="flRefSnapL" style="max-width:340px;display:none;margin-top:4px;border:1px solid #ccc;" />
-      </div>
-
-      <div class="card">
-        <h3>🦿 右臂:取中间件 → 放料仓</h3>
-        <p class="muted">执行顺序:<b>B0(可选) → B1 → PBVS对准·中间件(自动) → B2 →
-          B3 → PBVS对准·料仓(自动) → B4</b>。对准之后再播 B2/B4 下降动作。</p>
-        <div id="flActsRight"></div>
-        <p class="muted" style="margin:6px 0 0;">动作之间想插夹爪操作(开合到目标值再等一会)→ 用下方
-          「🤏 动作间夹爪整形」卡片,任意位置可插。</p>
-        <div class="row" style="margin-top:8px;">
-          <span class="muted">PBVS 参考两处:</span>
-          <button id="flRefR1" class="primary">📌 记录中间件参考(当前位)</button>
-          <button id="flTestR1">🔍 测试</button>
-          <button id="flGotoR1">🧲 回观察位并测</button>
-          <button id="flFixR1">⚡ 回观察位并修正</button>
-          <button id="flRefR2" class="primary">📌 记录料仓参考(当前位)</button>
-          <button id="flTestR2">🔍 测试</button>
-          <button id="flGotoR2">🧲 回观察位并测</button>
-          <button id="flFixR2">⚡ 回观察位并修正</button>
-        </div>
-        <pre id="flFixOut" class="muted" style="margin:6px 0 0;white-space:pre-wrap;font-size:12px;max-height:180px;overflow-y:auto;border:1px dashed #456;border-radius:4px;padding:4px 8px;">⚡『回观察位并修正』的单步验证输出显示在这里(三处按钮共用,与流水线闸门同一条代码路径;修完停在修正后的位置,Δ 锚不传导)。</pre>
+        <h4 id="flPBVSR1Title">🦿 右臂 PBVS · 取料位</h4>
         <div class="row">
-          <label title="停用=右臂中间件站跳过 PBVS 对准:按示教关节回放,不测码不修正(只影响这一站;改完对下次启动生效)"><input type="checkbox" id="flEnR1" checked /> 启用·中间件</label>
-          <span>中间件码:</span>
-          <label>类型
+          <label title="停用=该臂不做 PBVS:按示教关节回放,不测码不修正(改完对下次启动生效,运行中的流水线不变)"><input type="checkbox" id="flEnR1" checked /> 启用 PBVS</label>
+          <label>码类型
             <select id="flRMk1Type">
               <option value="aruco">ArUco</option>
               <option value="qr">QR 二维码</option>
@@ -635,27 +643,70 @@
           <label>ArUco ID <input id="flRMk1Id" type="number" min="0" max="49" step="1" value="1" size="3" /></label>
           <label>QR 内容 <input id="flRMk1Data" type="text" size="8" placeholder="留空=任意" /></label>
           <label>码边mm <input id="flRMk1Size" type="number" min="20" max="500" step="1" value="100" size="4" /></label>
-          <label title="停用=料仓站跳过 PBVS 对准:按示教关节回放,不测码不修正(只影响这一站;改完对下次启动生效)"><input type="checkbox" id="flEnR2" checked /> 启用·料仓</label>
-          <span>料仓码:</span>
-          <label>类型
-            <select id="flRMk2Type">
-              <option value="aruco">ArUco</option>
-              <option value="qr">QR 二维码</option>
-            </select>
-          </label>
-          <label>ArUco ID <input id="flRMk2Id" type="number" min="0" max="49" step="1" value="2" size="3" /></label>
-          <label>QR 内容 <input id="flRMk2Data" type="text" size="8" placeholder="留空=任意" /></label>
-          <label>码边mm <input id="flRMk2Size" type="number" min="20" max="500" step="1" value="100" size="4" /></label>
           <button id="flSaveMkR">💾 存码参数</button>
+          <button id="flRefR1" class="primary">📌 记录 PBVS 参考(当前位)</button>
+          <button id="flTestR1">🔍 测试</button>
+          <button id="flGotoR1">🧲 回观察位并测</button>
+          <button id="flFixR1">⚡ 回观察位并修正</button>
         </div>
-        <div id="flRefInfoR" class="muted">中间件参考:未记录 | 料仓参考:未记录。分别在 B1 末点、B3 末点记录。</div>
+        <div id="flPBVSR2Wrap">
+          <h4>🦿 右臂 PBVS · 料仓(经典流程第二站;流水线3 不使用)</h4>
+          <div class="row">
+            <label title="停用=料仓站跳过 PBVS 对准:按示教关节回放,不测码不修正(只影响这一站;改完对下次启动生效)"><input type="checkbox" id="flEnR2" checked /> 启用·料仓</label>
+            <span>料仓码:</span>
+            <label>类型
+              <select id="flRMk2Type">
+                <option value="aruco">ArUco</option>
+                <option value="qr">QR 二维码</option>
+              </select>
+            </label>
+            <label>ArUco ID <input id="flRMk2Id" type="number" min="0" max="49" step="1" value="2" size="3" /></label>
+            <label>QR 内容 <input id="flRMk2Data" type="text" size="8" placeholder="留空=任意" /></label>
+            <label>码边mm <input id="flRMk2Size" type="number" min="20" max="500" step="1" value="100" size="4" /></label>
+            <button id="flRefR2" class="primary">📌 记录料仓参考(当前位)</button>
+            <button id="flTestR2">🔍 测试</button>
+            <button id="flGotoR2">🧲 回观察位并测</button>
+            <button id="flFixR2">⚡ 回观察位并修正</button>
+          </div>
+        </div>
+        <div id="flRefInfoR" class="muted">取料位参考:未记录 | 料仓参考:未记录。</div>
         <img id="flRefSnapR" style="max-width:340px;display:none;margin-top:4px;border:1px solid #ccc;" />
+        <pre id="flFixOut" class="muted" style="margin:6px 0 0;white-space:pre-wrap;font-size:12px;max-height:180px;overflow-y:auto;border:1px dashed #456;border-radius:4px;padding:4px 8px;">⚡『回观察位并修正』的单步验证输出显示在这里(三处按钮共用,与流水线闸门同一条代码路径;修完停在修正后的位置,Δ 锚不传导)。</pre>
+      </div>
+
+      <div class="card">
+        <h3>🦾 左臂:视觉吸料 → 放中间件</h3>
+        <p class="muted">
+          吸料部分<b>全由视觉自动执行</b>(与『物料检测』页一步到位同款:参数、吸真空方式
+          沿用其设置;扫描位也在该页示教)。每轮循环执行顺序:<br>
+          <b>① 物料检测(自动:回扫描位 → YOLO+深度 → 基座系定位选袋)
+          → ② 移动到物料上方(自动:升越顶 → 转对准姿态 → 水平平移)
+          → ③ 下降+下压(自动:降到袋面,沿吸嘴轴向压入)
+          → ④ 吸取(手动:保持窗口内接真空)
+          → ⑤ 垂直抬升(自动) → A1(示教) → PBVS对准(自动) → A2(示教)</b>。<br>
+          你只需示教 A1 / A2(加上『物料检测』页的扫描位)。
+        </p>
+        <div id="flActsLeft"></div>
+        <p class="muted" style="margin:6px 0 0;">左臂 PBVS 的启停/码参数/参考记录测试都在上方
+          <b>「PBVS 参考(每臂一处)」</b>卡片。</p>
+      </div>
+
+      <div class="card">
+        <h3>🦿 右臂:取中间件 → 放料仓</h3>
+        <p class="muted">执行顺序:<b>B0(可选) → B1 → PBVS对准·中间件(自动) → B2 →
+          B3 → PBVS对准·料仓(自动) → B4</b>。对准之后再播 B2/B4 下降动作。</p>
+        <div id="flActsRight"></div>
+        <p class="muted" style="margin:6px 0 0;">动作之间想插夹爪操作(开合到目标值再等一会)→ 用下方
+          「🤏 动作间夹爪整形」卡片,任意位置可插。<br>
+          右臂 PBVS(取料位/料仓两处)的启停/码参数/参考记录测试都在上方
+          <b>「PBVS 参考(每臂一处)」</b>卡片。</p>
       </div>
 
       <div class="card">
         <h3>运行</h3>
         <div class="row">
           <span id="flFixture" class="badge off">中间件:?</span>
+          <span id="flRounds" class="badge off" title="整线轮次: 一轮=左臂吸放两摞+右臂夹完放完回归。首轮=冷启动(启动→首轮完成),其后=稳态轮周期">轮:?</span>
           <label title="留空/0=连续不停;N=每臂跑满 N 个循环后整线自动停(右臂会把第 N 件送完料仓才停)。单臂测试同样生效:填 N=该臂跑 N 循环,留空=1 循环">轮次
             <input id="flRounds" type="number" min="0" max="999" step="1" placeholder="连续" size="3" /></label>
           <label><input type="checkbox" id="flStepMode" /> 单步确认模式(每个动作前暂停等确认)</label>
@@ -680,15 +731,9 @@
         <pre id="flLog" class="posebox" style="max-height:120px;">-</pre>
         <div class="row" style="margin-top:6px;">
           <b>📈 运行报告</b>
-          <label>开始日期
-            <input id="flRptStart" type="date" /></label>
-          <label>结束日期
-            <input id="flRptEnd" type="date" /></label>
-          <button id="flRptView">🔍 预览</button>
-          <button id="flRptExport" class="primary">⬇ 导出 CSV</button>
+          <button id="flRptOpen">📊 打开报告页 ↗</button>
+          <span class="muted">独立页面: 整程并行甘特(一次启动一行)+ 轮次节拍(冷启动/稳态/右臂净夹放回归)+ CSV 导出。</span>
         </div>
-        <div id="flRptBox" class="muted"
-             style="margin-top:6px;">按时间段汇总每轮 A/B 大步耗时(默认当天),预览后可导出同口径 CSV。</div>
         <p class="muted">首次联调务必用单步确认模式 + 低速;急停用顶部 ⛔(断电级,流水线会自动停线)。</p>
       </div>
 
