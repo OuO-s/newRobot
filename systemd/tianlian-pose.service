@@ -1,0 +1,41 @@
+# tianlian-pose.service — 物料检测服务(pose_service.py)开机自启
+# =====================================================================
+# 作用: 用 yolo11_env 解释器(独立 GPU 进程)常驻 127.0.0.1:7100,
+#       webapp 与上位机 GUI 都是先探活 /health 再复用, 不会重复拉起。
+# 安装(本文件是仓库内模板, 需 sudo 拷到系统目录):
+#   sudo cp tianlian_webapp/systemd/tianlian-pose.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tianlian-pose
+# 运维:
+#   状态/日志  systemctl status tianlian-pose
+#              tail -f tianlian_webapp/logs/pose_service.log
+#   停止       sudo systemctl stop tianlian-pose
+#   ← 注意: 网页/GUI 的"停止服务"按钮只能停它们自己拉起的子进程,
+#     停不掉本服务(systemd 会在崩溃时自动拉回, 手动停须用上面的命令)
+
+[Unit]
+Description=Tianlian 物料检测服务 (pose_service, yolo11_env GPU @127.0.0.1:7100)
+After=multi-user.target
+# 不设启动次数上限: 哪怕权重暂时缺失也一直重试, 恢复后自愈
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=user
+Group=user
+WorkingDirectory=/home/user/tianlian/tianlian_webapp
+# 只补 venv 里 torch 缺的 cusparselt; cuDNN/cuBLAS 用系统 Jetson CUDA 栈
+# (与 app.py pose_service_start 的环境一致; 勿加 venv 自带 cudnn →
+#  会覆盖系统版本报 CUDNN_STATUS_NOT_INITIALIZED)
+Environment=LD_LIBRARY_PATH=/home/user/tianlian/old/tianlian/yolo11_env/lib/python3.10/site-packages/nvidia/cusparselt/lib
+ExecStartPre=/usr/bin/mkdir -p /home/user/tianlian/tianlian_webapp/logs
+ExecStart=/home/user/tianlian/old/tianlian/yolo11_env/bin/python /home/user/tianlian/tianlian_webapp/pose_service.py --weights /home/user/tianlian/tianlian_webapp/models/weilong_pose_best.pt --port 7100
+# 崩溃(CUDA OOM 等)5s 后自动拉回; systemctl stop 的 SIGTERM 属干净退出, 不会重启死循环
+Restart=on-failure
+RestartSec=5
+# 日志沿用 webapp 一直用的文件, tail -f 不用换地方
+StandardOutput=append:/home/user/tianlian/tianlian_webapp/logs/pose_service.log
+StandardError=append:/home/user/tianlian/tianlian_webapp/logs/pose_service.log
+
+[Install]
+WantedBy=multi-user.target
