@@ -55,6 +55,13 @@ REACH_POS_TOL_M = 5e-3       # 末端到达容差(与 fd_arm_api 近成功容差
 REACH_ROT_TOL_RAD = 5e-2
 JOINT_LIMIT_EPS_DEG = 1e-2
 NUM_POINTS = 6               # fd_arm_api straightline_num_points 默认值
+# 直线 IK 种子敏感失败的错误前缀(2026-11-18 实测: 流水线3 右臂 B3 点1
+# 平移 40mm,首解发散,同目标换邻近种子即解,半径 ~380mm 远未到臂展边界):
+# 这些失败换路点密度/换种子常可解出,值得重试;关节限位/跳解护栏类
+# 失败不在此列(后者有自适应分段专用通道)。
+SOLVER_RETRY_PREFIXES = (
+    "直线规划失败", "规划结果为空", "规划结果含非有限值", "目标位姿不可达",
+)
 
 
 def _load_yaml(path):
@@ -342,12 +349,13 @@ def handle_request(req: dict) -> dict:
     lower = list(kin.joint_lower or [])
     upper = list(kin.joint_upper or [])
 
-    def _seg_plan(T_from, T_to, q_from):
+    def _seg_plan(T_from, T_to, q_from, num_points=None):
         """一段直线:规划+全套校验。返回 (traj|None, err|None, max_dq)。
         err="NEAR_ZERO" = 起终位姿几乎一致(整段无需运动),由上层定夺。"""
         try:
             traj = kin.straightline(T_target=T_to, T_current=T_from,
-                                    q_initial=q_from, num_points=NUM_POINTS)
+                                    q_initial=q_from,
+                                    num_points=num_points or NUM_POINTS)
         except Exception as exc:
             return None, f"直线规划失败: {exc}", 0.0
         traj = [[float(v) for v in pt] for pt in (traj or [])]
@@ -398,6 +406,28 @@ def handle_request(req: dict) -> dict:
         return fail(f"目标与当前位姿几乎一致(最大关节变化 {max_dq:.3f}°),"
                     "无需运动")
     subdiv, note = 0, ""
+    # 种子敏感重试(2026-11-18): 首解失败且属求解器类错误时,先加密路点
+    # (步进 IK 步长更短)再小扰动种子(逃离局部极小)重试。每轮结果仍过
+    # 全部护栏(限位/跳解/相邻步长/FK 到达)——扰动只换求解起点,不放松
+    # 任何校验,解出跳分支会被护栏拒绝。
+    if err is not None and err.startswith(SOLVER_RETRY_PREFIXES):
+        first_err = err
+        rng = np.random.default_rng(20261118)
+        ladder = [(None, NUM_POINTS * 2), (None, NUM_POINTS * 4),
+                  (3.0, None), (5.0, None), (8.0, None)]
+        for i, (amp, npts) in enumerate(ladder, 1):
+            q_try = (list(q_deg) if amp is None else
+                     [v + float(d) for v, d in zip(
+                         q_deg, rng.uniform(-amp, amp, kin.num_joints))])
+            t, e, dq = _seg_plan(T_cur, T_target, q_try, num_points=npts)
+            if e is None:
+                traj, err, max_dq = t, None, dq
+                how = (f"种子扰动±{amp:.0f}°" if amp is not None
+                       else f"路点加密至{npts}")
+                note = (f"直线IK首解失败({first_err[:14]}…),"
+                        f"重试第{i}次成功({how})")
+                break
+            err = e
     if err is not None and err.startswith("跳解护栏: 关节最大变化") \
             and max_dq <= MAX_TOTAL_DQ_DEG:
         # 首尾超限但量级在合法重构范围内 → 按几何等分链式细分重试:

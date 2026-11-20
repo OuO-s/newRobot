@@ -591,6 +591,8 @@
           <label>XY容差mm <input id="flTolXY" type="number" min="0.5" max="20" step="0.5" value="2" size="3" /></label>
           <label>Z容差mm <input id="flTolZ" type="number" min="0.5" max="20" step="0.5" value="3" size="3" /></label>
           <label>修正上限mm <input id="flMaxCorr" type="number" min="5" max="100" step="5" value="40" size="3" /></label>
+          <label>角度容差° <input id="flTolYaw" type="number" min="0.5" max="10" step="0.5" value="1" size="3" title="码画面角容差(旋转修正);超差绕码旋转修正" /></label>
+          <label>角度上限° <input id="flMaxCorrDeg" type="number" min="1" max="45" step="1" value="10" size="3" title="单次旋转修正上限,超此值停线分型" /></label>
           <label>修正步数 <input id="flIter" type="number" min="1" max="4" step="1" value="2" size="2" /></label>
           <label>测帧中值 <input id="flFrames" type="number" min="1" max="5" step="1" value="3" size="2" /></label>
           <button id="flSaveCfg" class="primary">💾 保存</button>
@@ -644,11 +646,13 @@
           <label>QR 内容 <input id="flRMk1Data" type="text" size="8" placeholder="留空=任意" /></label>
           <label>码边mm <input id="flRMk1Size" type="number" min="20" max="500" step="1" value="100" size="4" /></label>
           <button id="flSaveMkR">💾 存码参数</button>
+          <button id="flObsRecR" title="把当前臂位记为右臂启动PBVS的独立观察位(流水线3 默认=B5点1 初始位)。记录参考也从这里录,视差基准才配套">📍 记录观察位(当前位)</button>
           <button id="flRefR1" class="primary">📌 记录 PBVS 参考(当前位)</button>
           <button id="flTestR1">🔍 测试</button>
           <button id="flGotoR1">🧲 回观察位并测</button>
           <button id="flFixR1">⚡ 回观察位并修正</button>
         </div>
+        <div id="flObsInfoR" class="muted" style="margin-top:2px;">观察位:未记录(回退:就位 B2 点1 兼作观察位)</div>
         <div id="flPBVSR2Wrap">
           <h4>🦿 右臂 PBVS · 料仓(经典流程第二站;流水线3 不使用)</h4>
           <div class="row">
@@ -695,6 +699,15 @@
         <h3>🦿 右臂:取中间件 → 放料仓</h3>
         <p class="muted">执行顺序:<b>B0(可选) → B1 → PBVS对准·中间件(自动) → B2 →
           B3 → PBVS对准·料仓(自动) → B4</b>。对准之后再播 B2/B4 下降动作。</p>
+        <div class="row" style="margin:2px 0 8px;flex-wrap:wrap;gap:8px;align-items:center;border:1px dashed #456;border-radius:6px;padding:6px 10px;">
+          <b>📦 双仓投放</b>
+          <label title="启用后 B3/B4/B5 示教区拆成『⬅左仓/➡右仓』两列分别示教,运行按轮次自动切仓:每 K 轮切一仓交替。停用=全部按左仓(原单仓行为)"><input type="checkbox" id="flBinsEn" /> 启用</label>
+          <label title="每仓连续投放的轮数 K:第 1~K 轮→左仓,第 K+1~2K 轮→右仓,如此往复。K=2 + 轮次填 4 = 前两轮左仓、后两轮右仓">每仓轮数 K
+            <input id="flBinsPer" type="number" min="1" max="99" step="1" value="2" size="2" /></label>
+          <button id="flBinsSave" class="primary">💾保存</button>
+          <span class="muted">B3 在共享段之后分仓(默认点3=料仓上方);B4/B5 整段分仓;
+            右仓列空=该动作两仓走同一路线。改完对下次启动生效。</span>
+        </div>
         <div id="flActsRight"></div>
         <p class="muted" style="margin:6px 0 0;">动作之间想插夹爪操作(开合到目标值再等一会)→ 用下方
           「🤏 动作间夹爪整形」卡片,任意位置可插。<br>
@@ -706,7 +719,7 @@
         <h3>运行</h3>
         <div class="row">
           <span id="flFixture" class="badge off">中间件:?</span>
-          <span id="flRounds" class="badge off" title="整线轮次: 一轮=左臂吸放两摞+右臂夹完放完回归。首轮=冷启动(启动→首轮完成),其后=稳态轮周期">轮:?</span>
+          <span id="flRoundsBadge" class="badge off" title="整线轮次: 一轮=左臂吸放两摞+右臂夹完放完回归。首轮=冷启动(启动→首轮完成),其后=稳态轮周期">轮:?</span>
           <label title="留空/0=连续不停;N=每臂跑满 N 个循环后整线自动停(右臂会把第 N 件送完料仓才停)。单臂测试同样生效:填 N=该臂跑 N 循环,留空=1 循环">轮次
             <input id="flRounds" type="number" min="0" max="999" step="1" placeholder="连续" size="3" /></label>
           <label><input type="checkbox" id="flStepMode" /> 单步确认模式(每个动作前暂停等确认)</label>
@@ -910,6 +923,6 @@
   </main>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=20261105-cartik"></script>
+  <script src="/static/app.js?v=20261117-rounds"></script>
 </body>
 </html>

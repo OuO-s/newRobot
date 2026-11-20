@@ -2479,6 +2479,9 @@ class FlowArmBody(BaseModel):
 
 class FlowArmActionBody(FlowArmBody):
     action: str
+    # 双仓投放(流水线3 右臂): L=左仓路点(缺省,原行为)/ R=右仓尾段。
+    # 仅 B3/B4/B5 支持 R;其它动作传 R 由 flow_store 拒绝
+    bin: str = "L"
 
 
 class FlowWpDelBody(FlowArmActionBody):
@@ -2506,6 +2509,11 @@ class FlowTitleBody(FlowArmActionBody):
     title: str
 
 
+class FlowBinSplitBody(FlowArmBody):
+    action: str
+    split: int = 0             # 双仓动作共享前缀点数(0~len(waypoints))
+
+
 class FlowAlignBody(BaseModel):
     arm: str
     which: str = "align"         # align=中间件 / align2=料仓(仅右臂)
@@ -2522,6 +2530,14 @@ def _flow_arm(s: str) -> str:
         return _normalize_arm(s)
     except HTTPException as e:
         raise _err(f"{e.detail}(armleft/armright)", 400) from None
+
+
+def _flow_bin(s: str | None) -> str:
+    """双仓参数归一: L/R(缺省 L;其它值 400)。"""
+    b = (s or "L").upper()
+    if b not in ("L", "R"):
+        raise _err('bin 只能是 "L"(左仓)/"R"(右仓)', 400)
+    return b
 
 
 def _flow_guard_moving():
@@ -2705,19 +2721,22 @@ def flow_teach_waypoint(body: FlowArmActionBody):
         wp = flow_store.record_waypoint(arm, body.action, q,
                                         {"position": [float(v) for v in pos],
                                          "orientation": [float(v)
-                                                         for v in quat]})
+                                                         for v in quat]},
+                                        bin=_flow_bin(body.bin))
     except ValueError as e:
         raise _err(str(e), 400)
-    return {"ok": True, "waypoint": wp,
-            "count": len(flow_store.load_config()["arms"][arm]
-                         ["actions"][body.action]["waypoints"])}
+    b = _flow_bin(body.bin)
+    a = flow_store.load_config()["arms"][arm]["actions"][body.action]
+    count = (len((a.get("bins") or {}).get("tail") or []) if b == "R"
+             else len(a["waypoints"]))
+    return {"ok": True, "waypoint": wp, "bin": b, "count": count}
 
 
 @app.post("/api/flow/teach/waypoint/delete")
 def flow_teach_waypoint_del(body: FlowWpDelBody):
     try:
         flow_store.delete_waypoint(_flow_arm(body.arm), body.action,
-                                   body.index)
+                                   body.index, bin=_flow_bin(body.bin))
     except ValueError as e:
         raise _err(str(e), 400)
     return {"ok": True}
@@ -2741,7 +2760,8 @@ def flow_teach_waypoint_overwrite(body: FlowWpDelBody):
         wp = flow_store.overwrite_waypoint(
             arm, body.action, body.index, q,
             {"position": [float(v) for v in pos],
-             "orientation": [float(v) for v in quat]})
+             "orientation": [float(v) for v in quat]},
+            bin=_flow_bin(body.bin))
     except ValueError as e:
         raise _err(str(e), 400)
     return {"ok": True, "waypoint": wp}
@@ -2753,7 +2773,8 @@ def flow_teach_waypoint_move(body: FlowWpMoveBody):
     _flow_guard_moving()
     try:
         flow_store.move_waypoint(_flow_arm(body.arm), body.action,
-                                 body.index, body.offset)
+                                 body.index, body.offset,
+                                 bin=_flow_bin(body.bin))
     except ValueError as e:
         raise _err(str(e), 400)
     return {"ok": True}
@@ -2765,7 +2786,8 @@ def flow_teach_center_mark(body: FlowCenterMarkBody):
     _flow_guard_moving()
     try:
         wp = flow_store.mark_center(_flow_arm(body.arm), body.action,
-                                    body.index, body.center)
+                                    body.index, body.center,
+                                    bin=_flow_bin(body.bin))
     except ValueError as e:
         raise _err(str(e), 400)
     return {"ok": True, "waypoint": wp,
@@ -2778,16 +2800,31 @@ def flow_teach_waypoint_wait(body: FlowWpWaitBody):
     _flow_guard_moving()
     try:
         wp = flow_store.set_waypoint_wait(_flow_arm(body.arm), body.action,
-                                          body.index, body.seconds)
+                                          body.index, body.seconds,
+                                          bin=_flow_bin(body.bin))
     except ValueError as e:
         raise _err(str(e), 400)
     return {"ok": True, "waypoint": wp, "wait_s": wp.get("wait_s")}
 
 
+@app.post("/api/flow/teach/bin_split")
+def flow_teach_bin_split(body: FlowBinSplitBody):
+    """双仓动作设共享前缀点数: waypoints 前 split 点两仓共用,
+    其后=左仓尾段(右仓尾段在 bins.tail)。仅右臂 B3/B4/B5。"""
+    _flow_guard_moving()
+    try:
+        b = flow_store.set_bin_split(_flow_arm(body.arm), body.action,
+                                     body.split)
+    except ValueError as e:
+        raise _err(str(e), 400)
+    return {"ok": True, "bins": b}
+
+
 @app.post("/api/flow/teach/clear")
 def flow_teach_clear(body: FlowArmActionBody):
     try:
-        flow_store.clear_action(_flow_arm(body.arm), body.action)
+        flow_store.clear_action(_flow_arm(body.arm), body.action,
+                                bin=_flow_bin(body.bin))
     except ValueError as e:
         raise _err(str(e), 400)
     return {"ok": True}
@@ -2836,12 +2873,13 @@ def flow_action_play(body: FlowArmActionBody):
             raise _err(str(e), 400)
         # 空动作不再拒:run_once 会提示"无路点,跳过"后正常结束
         # (与流水线循环同语义,2026-11-09)
+        bin = _flow_bin(body.bin)
         th = threading.Thread(target=loop.run_once,
-                              args=(body.action,), daemon=True,
+                              args=(body.action, bin), daemon=True,
                               name=f"flow-test-{arm}")
         _TEST_PLAY = {"runner": runner, "loop": loop, "thread": th}
         th.start()
-    return {"ok": True, "arm": arm, "action": body.action}
+    return {"ok": True, "arm": arm, "action": body.action, "bin": bin}
 
 
 @app.post("/api/flow/action/play/stop")
@@ -2862,6 +2900,38 @@ def flow_action_play_status():
     out = loop.status()
     out["running"] = bool(th and th.is_alive())
     return out
+
+
+@app.post("/api/flow/teach/obs_pose")
+async def flow_teach_obs_pose(body: FlowAlignBody):
+    """把当前臂位记录为该站启动PBVS的独立观察位(不动臂、不需要相机)。
+    右臂流水线3 观察位默认=B5点1(初始位);记录后启动PBVS 先回这里
+    测一次拿 Δ,参考也应从这个位置录(视差基准才配套)。"""
+    _flow_guard_moving()
+    robot = _pick_robot()
+    arm = _flow_arm(body.arm)
+    which = body.which if body.which in ("align", "align2") else "align"
+    if which == "align2" and arm != "armright":
+        raise _err("align2(料仓)只有右臂有", 400)
+    try:
+        q = robot.get_joint_angles().get(arm) or []
+        if not q:
+            raise RobotError("关节读取失败(臂未上电?)")
+        ep = (robot.get_end_poses().get(arm)) or {}
+        pos, quat = ep.get("position"), ep.get("orientation")
+        if not pos or not quat:
+            raise RobotError("末端位姿读取失败(臂未上电?)")
+        pose = {"joints_deg": [float(v) for v in q],
+                "end_pose": {"position": list(pos),
+                             "orientation": list(quat)},
+                "created": flow_runlog.iso(),
+                "note": "手动记录"}
+        flow_store.save_obs_pose(arm, which, pose)
+    except (RobotError, DepthError) as e:
+        raise _err(str(e), 502)
+    except ValueError as e:
+        raise _err(str(e), 400)
+    return {"ok": True, "obs_pose": pose}
 
 
 @app.post("/api/flow/teach/align_ref")

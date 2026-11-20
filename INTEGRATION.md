@@ -16,11 +16,12 @@ webapp(flow.py) ── CutterFlow ── CutterWS ── ws://10.245.169.248:876
                                                      └─ 升降台(上/下限位开关 + 按圈数走脉冲)
 ```
 
-- **指令**: `push`(推杆往返) / `lift`(dir+revs) / `cycle`(推杆+升降联动) /
-  `stop` / `status`
+- **指令**: `push`(推杆往返) / `lift`(dir+revs+**skip_if_at**) /
+  `cycle`(推杆+升降联动) / `stop` / `status`(带 `lift` 位置快照) / `valve`
 - **应答三段**: `hello`(连接即发,带 busy/last_done) → `ack`(受理) →
   `done`(动作完成,含 `ok/ms/legs[]`,每条腿 `result` =
-  `limit_neg/limit_pos/position/aborted/timeout/comms/error`)
+  `limit_neg/limit_pos/position/aborted/timeout/comms/error`;
+  免动秒过时 result=`already_at_top`/`already_at_middle`,ok=true)
 - **一次只执行一个动作**(busy 期间新指令回 `busy` 错);动作独立于连接跑完,
   结果留在服务端 `last_done`,断线重连可对账找回
 - `cycle` 联动(对应手动控制台按钮 7/8):
@@ -83,6 +84,27 @@ webapp(flow.py) ── CutterFlow ── CutterWS ── ws://10.245.169.248:876
   推杆回位后断电);阀失败即停线(该吸没吸/该放没放都不能静默跑)。
   手动验接线: 裁剪机构卡片「🔌 吸盘阀·通电/⚡ 断电」按钮(流水线
   运行中拒绝,阀归编排管)。状态查询带 `valve` 字段(true/false/null)。
+- **阀指令并发模型(2026-11-20 修,重要)**: `CutterWS._lock` 只保护
+  连接管理与收发记账(注册 id + 发送,毫秒级),**等 ack/done 的轮询
+  一律在锁外** —— 否则一个线程等推②/降Mid done 时会把整条连接锁住
+  5~12s,左臂阀指令根本发不出去(11-17 实测: 吸①阀 8.9s、放①阀
+  3.7s,每轮白等 ~11s,根因曾误判为 485/服务端串行,后经 Jetson 日志
+  排除 —— 服务端动作跑独立线程、阀走独立串口、handler 不排队,阀在
+  动作中途 319ms 即被处理)。修复后推杆在跑时阀 ~0.4s 回包,阀失败/
+  超时仍同步抛错停线,语义不变。回归: `/tmp/cutter_mock/test_ws_concurrent.py`
+  (并发阀/断线对账/吞帧对账/busy 拒绝/stop/多轮无泄漏 13 例)。
+- **节拍时延(2026-11-17 调优)**: A1 到位稳像 `settle_s`=0.1s;
+  电磁阀吸/放后的保持窗一律 0.5s(pick 配置 `hold_s` 与闸门
+  `hold_grab_s`/`hold_open_s`)。若 0.1s 稳像让 YOLO 检出变差
+  (运动模糊),现场回调 0.3~0.5 即可,两处配置网页都可改。
+- **推②料仓校验**: 每轮计数断真空放料次数(2 点示教=显式断真空;
+  ≥3 点示教=A2 动作配了 `vacuum.event=release` 即计),两摞没放齐
+  (released<2)→ 推②前停线报"料仓未满2摞" —— 防 A2 忘配真空/
+  吸盘没放时推空料仓再升起。
+- **升降免动秒过(skip_if_at,2026-11-17)**: 流程回零/降中间点指令带
+  `skip_if_at`,Jetson 端判已在目标位就直接回 `done`(腿 result=
+  `already_at_*`,机构不动): 流程停在顶后重启→回零跳过(~4s);停在
+  中间→回零+下降全免(~8s)。信任边界见 §4。
 - 闸门观察位=A2 点2;startup 模式首轮定标全程平移。
 - 令牌语义沿用中间件方案: `EMPTY`=升降台可降(右臂已取走) /
   `FILLED`=两摞已在最高点(右臂可取)
@@ -105,6 +127,27 @@ webapp(flow.py) ── CutterFlow ── CutterWS ── ws://10.245.169.248:876
 升降下限位在下、且 Jetson 会在 `limit_neg`(下限位)时报警 ——
 若 `middle_revs` 设太大,`lift_middle` 会直接报错(腿结果=`limit_neg`),
 把圈数改小即可,不会撞坏。
+
+### 4.1 升降免动判断(skip_if_at)与信任边界
+
+- **`at_top`(永可信)**: 升降驱动器 DI 上限位输入(reg6 bit 0x02),
+  物理信号,任何情况下都可信。流程回零 `lift_home_top` 带
+  `skip_if_at=top` —— 已在顶就免动。
+- **`at_middle`(依赖基准跟踪)**: Jetson 在**任一升降腿撞上限位钉停**
+  时记录 `top_ref=read_pos`(服务内存态);`at_middle` =
+  `|pos − (top_ref − middle_revs×1000)| ≤ 300 脉冲`。`lift_middle`
+  带 `skip_if_at=middle` —— 已在中间点就免动。
+- **基准何时失效**: ①Jetson 服务重启(top_ref 丢);②手动控制台
+  (double_control_linux.py)动过升降 —— 它不经过 ws_control,top_ref
+  不跟着走。失效的表现 = 该跳过时没跳过(照常动一遍),**绝不会
+  反向出错**(不会在错误位置声称已在目标位 —— at_middle 判不中就
+  走正常动作,顶多浪费几秒)。
+- **重建基准**: 手动跑一次「⬆ 升到最高」(必撞顶,手动按钮不带
+  skip)或重启 Jetson 服务后跑一次流程回零,撞顶即记录。
+- `status`/`hello` 响应带 `lift:{at_top,pos,top_ref,at_middle}` 快照
+  (at_middle 按 11 圈展示口径,实际跳过判断用指令自带 revs)。
+- **旧版 Jetson 服务端会忽略未知的 `skip_if_at` 键** → 两侧部署顺序
+  无要求,最坏退化为"没有免动优化",行为同旧版。
 
 ## 5. 现场启动清单(按顺序)
 

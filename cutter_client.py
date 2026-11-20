@@ -7,9 +7,10 @@ cutter_client.py — 裁剪机构(推杆+升降台)websocket 客户端
 
 协议摘要(完整见 Jetson 端源码头注释):
   请求: {"id":N, "cmd":"push","mode":"cycle|left|right"[,"speed"]}
-        {"id":N, "cmd":"lift","dir":"down|up"[,"revs":圈数][,"speed"]}
+        {"id":N, "cmd":"lift","dir":"down|up"[,"revs":圈数][,"speed"]
+                 [,"skip_if_at":"top"|"middle"]}
         {"id":N, "cmd":"cycle"[,"lift_dir":"down|up"]}   ← 联动
-        {"id":N, "cmd":"stop"} / {"id":N, "cmd":"status"}
+        {"id":N, "cmd":"stop"} / {"id":N, "cmd":"status"} / {"id":N,"cmd":"valve"}
   响应: hello(连上即发,带状态) → ack(受理) → done(动作完成,带 ok+legs)
         / error(busy|bad_cmd|bad_args|bad_json)
   服务器每次只执行一个动作,不排队;动作独立于连接执行到底并把结果
@@ -49,6 +50,8 @@ LEG_CN = {
     "limit_neg": "撞负向限位钉停(左/下)",
     "limit_pos": "撞正向限位钉停(右/上)",
     "position": "走完脉冲自然停",
+    "already_at_top": "已在最高点·免动",
+    "already_at_middle": "已在中间点·免动",
     "aborted": "被stop中止",
     "timeout": "等待超时!!",
     "comms": "通讯丢失!!",
@@ -62,7 +65,16 @@ def _legs_cn(done: dict) -> str:
 
 
 class CutterWS:
-    """单连接 websocket 客户端(线程安全,懒连接,断线由调用方恢复)。"""
+    """单连接 websocket 客户端(线程安全,懒连接,断线由调用方恢复)。
+    并发模型: _lock 只保护连接管理/收发记账(毫秒级),等待 ack/done
+    一律在锁外 —— 多线程(推杆等待线程/升降线程/左臂阀指令)可同时
+    在一条连接上并发收发,互不阻塞(2026-11-20 修,此前 wait/_request
+    跨整个动作等待持锁,阀指令被拖到机构动作结束才发出去)。"""
+
+    # wait() 里 done 迟迟未到时,每隔这么久在同连接上主动问一次
+    # last_done 对账(2026-11-17 实测: 网络黑洞把 done 帧吞掉,TCP 重传
+    # 67s 后才送到,期间臂在 A2 点2 干等 —— 主动对账 ≤10s 就能收回)
+    POLL_DONE_S = 10.0
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -174,23 +186,27 @@ class CutterWS:
 
     # ------------------------------------------------------------ 收发
     def _register(self) -> dict:
-        self._seq += 1
-        p = {"ev": threading.Event(), "msg": None, "acked": False}
-        self._pending[self._seq] = p
-        return self._seq, p
+        with self._lock:                              # _seq/_pending 记账
+            self._seq += 1
+            rid = self._seq
+            p = {"ev": threading.Event(), "msg": None, "acked": False}
+            self._pending[rid] = p
+        return rid, p
 
     def _send(self, payload: dict):
-        if self._ws is None:
+        with self._lock:                              # 快照连接,防中途换线
+            ws, loop, slock = self._ws, self._loop, self._send_lock
+        if ws is None:
             raise CutterError("裁剪机构未连接")
 
         async def _do():
-            assert self._send_lock is not None
-            async with self._send_lock:
-                await self._ws.send(json.dumps(payload, ensure_ascii=False))
+            if slock is None:
+                raise CutterError("连接正在重建,稍后重试")
+            async with slock:
+                await ws.send(json.dumps(payload, ensure_ascii=False))
 
         try:
-            asyncio.run_coroutine_threadsafe(_do(), self._loop) \
-                .result(3.0)
+            asyncio.run_coroutine_threadsafe(_do(), loop).result(3.0)
         except CutterError:
             raise
         except Exception as e:                        # noqa: BLE001
@@ -199,31 +215,36 @@ class CutterWS:
     def _request(self, cmd: str, args: dict, timeout: float,
                  ack_only: bool = False, abort_cb=None) -> dict:
         """发一条指令并等回复。ack_only=True: 收到 ack 即返回(stop 用)。
-        否则等 done/error/status 之一,返回该消息。"""
-        with self._lock:
-            rid, p = self._register()
-            try:
+        否则等 done/error/status 之一,返回该消息。
+        锁只盖注册+发送(毫秒级),等回复在锁外 —— 否则一个线程等长
+        动作 done 期间会把整条连接锁住,别的线程(如左臂阀指令)发不出
+        去(2026-11-20 实测: 阀回包被推②/降Mid拖到动作结束+0.9s 即此)。"""
+        rid = None
+        try:
+            with self._lock:
+                rid, p = self._register()
                 self._send({"id": rid, "cmd": cmd, **args})
-                deadline = time.time() + timeout
-                while True:
-                    if abort_cb and abort_cb():
-                        raise CutterAborted("软停:等待裁剪机构期间中断")
-                    if p["ev"].wait(0.1):
-                        return p["msg"]
-                    if p["acked"] and ack_only:
-                        return {"type": "ack", "id": rid, "cmd": cmd}
-                    if time.time() > deadline:
-                        raise CutterError(
-                            f"裁剪指令 {cmd} 等待响应超时 {timeout:g}s"
-                            "(连接断开或服务器无应答)")
-            finally:
+            deadline = time.time() + timeout
+            while True:
+                if abort_cb and abort_cb():
+                    raise CutterAborted("软停:等待裁剪机构期间中断")
+                if p["ev"].wait(0.1):
+                    return p["msg"]
+                if p["acked"] and ack_only:
+                    return {"type": "ack", "id": rid, "cmd": cmd}
+                if time.time() > deadline:
+                    raise CutterError(
+                        f"裁剪指令 {cmd} 等待响应超时 {timeout:g}s"
+                        "(连接断开或服务器无应答)")
+        finally:
+            if rid is not None:
                 self._pending.pop(rid, None)
 
     # ------------------------------------------------------------ 公开接口
     def status(self, url: str, timeout: float = 3.0) -> dict:
         with self._lock:
             self.connect(url, timeout=min(timeout, 5.0))
-            out = self._request("status", {}, timeout)
+        out = self._request("status", {}, timeout)
         if out.get("type") == "error":
             raise CutterError(f"status 失败: {out}")
         return out
@@ -231,8 +252,7 @@ class CutterWS:
     def stop(self, url: str, timeout: float = 3.0) -> dict:
         with self._lock:
             self.connect(url, timeout=min(timeout, 5.0))
-            out = self._request("stop", {}, timeout, ack_only=True)
-        return out
+        return self._request("stop", {}, timeout, ack_only=True)
 
     def run(self, url: str, cmd: str, timeout: float, args: dict | None = None,
             abort_cb=None) -> dict:
@@ -240,7 +260,7 @@ class CutterWS:
         args = args or {}
         with self._lock:
             self.connect(url, timeout=5.0)
-            out = self._request(cmd, args, timeout, abort_cb=abort_cb)
+        out = self._request(cmd, args, timeout, abort_cb=abort_cb)
         if out.get("type") == "error":
             raise CutterError(f"裁剪指令 {cmd} 被拒: {out.get('code')}"
                               f"({out.get('hint') or out.get('msg') or ''})")
@@ -248,57 +268,94 @@ class CutterWS:
 
     def begin(self, url: str, cmd: str, args: dict | None = None,
               ack_timeout: float = 4.0, abort_cb=None) -> int:
-        """发运动指令,等到 ack(受理)即返回 —— 完成消息由 wait() 收。"""
+        """发运动指令,等到 ack(受理)即返回 —— 完成消息由 wait() 收。
+        (等 ack 也在锁外: 网络黑洞吞帧时不能把连接锁住几秒)"""
         args = args or {}
-        with self._lock:
-            self.connect(url, timeout=5.0)
-            rid, p = self._register()
-            try:
+        rid = None
+        try:
+            with self._lock:
+                self.connect(url, timeout=5.0)
+                rid, p = self._register()
                 self._send({"id": rid, "cmd": cmd, **args})
-                deadline = time.time() + ack_timeout
-                while True:
-                    if abort_cb and abort_cb():
-                        raise CutterAborted("软停:等待裁剪机构受理期间中断")
-                    if p["ev"].wait(0.05):
-                        msg = p["msg"]
-                        if msg.get("type") == "error":
-                            raise CutterError(
-                                f"裁剪指令 {cmd} 被拒: {msg.get('code')}")
-                        return rid                     # 受理前就完成了(少见)
-                    if p["acked"]:
-                        return rid
-                    if time.time() > deadline:
-                        raise CutterError(f"裁剪指令 {cmd} 无受理响应"
-                                          "(连接断开?)")
-            except BaseException:
+            deadline = time.time() + ack_timeout
+            while True:
+                if abort_cb and abort_cb():
+                    raise CutterAborted("软停:等待裁剪机构受理期间中断")
+                if p["ev"].wait(0.05):
+                    msg = p["msg"]
+                    if msg.get("type") == "error":
+                        raise CutterError(
+                            f"裁剪指令 {cmd} 被拒: {msg.get('code')}")
+                    return rid                     # 受理前就完成了(少见)
+                if p["acked"]:
+                    return rid
+                if time.time() > deadline:
+                    raise CutterError(f"裁剪指令 {cmd} 无受理响应"
+                                      "(连接断开?)")
+        except BaseException:
+            if rid is not None:
                 self._pending.pop(rid, None)
-                raise
+            raise
 
     def wait(self, url: str, handle: int, timeout: float,
              abort_cb=None) -> dict:
-        """等 begin() 那条指令的 done。断线时重连对账恢复。"""
+        """等 begin() 那条指令的 done。断线时重连对账恢复;
+        done 迟迟不到(连接还活着=网络黑洞吞帧,TCP 重传分钟级)时,
+        每 POLL_DONE_S 秒主动问一次 last_done 提前收回结果。
+        **等待全程不持锁**(2026-11-20 修): 旧版把整个轮询循环关在
+        _lock 里,等推②/降Mid的线程会锁住连接 5~12s,左臂阀指令在
+        run() 拿锁处被堵到动作结束 —— 每轮白等 ~11s 的元凶。"""
         with self._lock:
             p = self._pending.get(handle)
-            if p is None:
-                raise CutterError(f"裁剪动作#{handle} 不存在或已收尾")
-            deadline = time.time() + timeout
-            while True:
-                if abort_cb and abort_cb():
-                    raise CutterAborted("软停:等待裁剪动作完成期间中断")
-                if p["ev"].wait(0.25):
-                    msg = p["msg"]
-                    if msg.get("type") == "error":
-                        raise CutterError(f"裁剪动作#{handle} 失败: "
-                                          f"{msg.get('code')}")
+        if p is None:
+            raise CutterError(f"裁剪动作#{handle} 不存在或已收尾")
+        deadline = time.time() + timeout
+        next_poll = time.time() + self.POLL_DONE_S
+        while True:
+            if abort_cb and abort_cb():
+                raise CutterAborted("软停:等待裁剪动作完成期间中断")
+            if p["ev"].wait(0.25):
+                msg = p["msg"]
+                if msg.get("type") == "error":
+                    raise CutterError(f"裁剪动作#{handle} 失败: "
+                                      f"{msg.get('code')}")
+                self._pending.pop(handle, None)
+                return msg
+            if self._ws is None:                  # 连接断了 → 恢复
+                return self._recover(url, handle,
+                                     max(10.0, deadline - time.time()),
+                                     abort_cb)
+            if time.time() >= next_poll:          # done 晚点 → 主动对账
+                next_poll = time.time() + self.POLL_DONE_S
+                ld = self._poll_last_done(handle)
+                if ld is not None:
                     self._pending.pop(handle, None)
-                    return msg
-                if self._ws is None:                  # 连接断了 → 恢复
-                    return self._recover(url, handle,
-                                         max(10.0, deadline - time.time()),
-                                         abort_cb)
-                if time.time() > deadline:
-                    raise CutterError(f"裁剪动作#{handle} 超时 {timeout:g}s"
-                                      " —— 机构状态未知,停线人工确认")
+                    return ld
+            if time.time() > deadline:
+                raise CutterError(f"裁剪动作#{handle} 超时 {timeout:g}s"
+                                  " —— 机构状态未知,停线人工确认")
+
+    def _poll_last_done(self, handle: int) -> dict | None:
+        """同一连接发一条 status,用服务端留底的 last_done 对账未到的
+        done。3s 无回复=黑洞还没过去,返回 None 继续等;对得上就当
+        done 收到(服务端动作独立于连接执行完并留底,结果等价)。"""
+        try:
+            rid, sp = self._register()
+            try:
+                self._send({"id": rid, "cmd": "status"})
+                if not sp["ev"].wait(3.0):
+                    return None
+                st = sp["msg"]
+                if st.get("type") != "status":
+                    return None
+                ld = st.get("last_done") or {}
+                if ld.get("id") == handle and ld.get("type") == "done":
+                    return ld
+            finally:
+                self._pending.pop(rid, None)
+        except Exception:                             # noqa: BLE001
+            return None
+        return None
 
     def _recover(self, url: str, handle: int, timeout: float,
                  abort_cb=None) -> dict:
@@ -336,13 +393,15 @@ class CutterFlow:
     """cfg = flow_config 顶层 "cutter" 节; log = callable(str) 记流水线日志。
 
     高层动作(全部阻塞到 Jetson 回 done,ok=False 抛错停线):
-      lift_home_top()     升降升到最高(撞上限位钉停)—— 回零/基准
+      lift_home_top()     流程回零=升到最高;已在顶(DI上限位)免动秒过
       lift_lowest()       升降降到最低(撞下限位钉停)
       lift_middle()       升降从最高点下降 middle_revs 圈 = 中间点
                           (与手动台 double_control_linux.py 按键4同义:
                           LIFT_DEF_REVS=11 默认;每轮第2推联动升到上限位
-                          重新对齐基准,圈数走脉冲自然停,无累积误差)
-      lift_highest()      同 lift_home_top(手动按钮用)
+                          重新对齐基准,圈数走脉冲自然停,无累积误差);
+                          已在中间点(基准跟踪判中)免动秒过
+      lift_highest()      升到最高但**不带免动判断**(手动按钮/标定用:
+                          手动台动过升降后,靠这一次撞顶重建 top_ref 基准)
       lift_revs(dir,n)    按圈数步进(标定中间点用)
       push_cycle(lift_dir) 推杆往返(去左限位=剪切,回右限位);
                           lift_dir="down"/"up" = 回程同时升降降/升到限位
@@ -447,7 +506,8 @@ class CutterFlow:
                         abort_cb=abort_cb), "升降→最低")
 
     def lift_highest(self, abort_cb=None) -> dict:
-        """升降升到最高(撞上限位钉停)—— 手动按钮/回零用。"""
+        """升降升到最高(撞上限位钉停)—— 手动按钮用。不带 skip_if_at:
+        手动台动过升降后,靠这一次撞顶重建 Jetson 端 top_ref 基准。"""
         if self.sim:
             self._sim_sleep("升降→最高", 2.5)
             return {"ok": True, "sim": True}
@@ -455,7 +515,16 @@ class CutterFlow:
             self.ws.run(self.url, "lift", self._t_lift, {"dir": "up"},
                         abort_cb=abort_cb), "升降→最高")
 
-    lift_home_top = lift_highest          # 语义别名: 回零=升到上限位
+    def lift_home_top(self, abort_cb=None) -> dict:
+        """流程启动回零=升到最高;已在顶(DI 上限位,物理可信)则秒过不动。
+        手动标定/重建基准请用 lift_highest(必撞顶)。"""
+        if self.sim:
+            self._sim_sleep("升降→最高", 2.5)
+            return {"ok": True, "sim": True}
+        return self._check(
+            self.ws.run(self.url, "lift", self._t_lift,
+                        {"dir": "up", "skip_if_at": "top"},
+                        abort_cb=abort_cb), "升降→最高")
 
     def lift_revs(self, direction: str, revs: float, abort_cb=None) -> dict:
         """按圈数走(自然停,不撞限位)—— 标定中间点用手动步进。"""
@@ -471,13 +540,16 @@ class CutterFlow:
         """升降 → 中间点 = 从最高点下降 middle_revs 圈(脉冲自然停)。
         基准保证: 每轮第2推 push_cycle("up") 回程把升降撞上限位钉停,
         之后右臂才来取料(EMPTY),所以本动作出发时必在最高点 —— 与手动台
-        「按键6 升到上限位 → 按键4 下降 N 圈」同一套用法。"""
+        「按键6 升到上限位 → 按键4 下降 N 圈」同一套用法。
+        skip_if_at=middle: 已在中间点(基准跟踪判中)则秒过不动 —— 免掉
+        流程重启后的回零+下降空跑(信任边界见 INTEGRATION §4)。"""
         revs = float(self.cfg.get("middle_revs", 11.0))
         if self.sim:
             self._sim_sleep(f"升降↓{revs:g}圈→中间点", 1.5)
             return {"ok": True, "sim": True}
         done = self.ws.run(self.url, "lift", self._t_lift,
-                           {"dir": "down", "revs": revs}, abort_cb=abort_cb)
+                           {"dir": "down", "revs": revs,
+                            "skip_if_at": "middle"}, abort_cb=abort_cb)
         out = self._check(done, f"升降↓{revs:g}圈→中间点")
         for leg in done.get("legs", []):        # 圈数走完应是"自然停"
             if leg.get("result") == "limit_neg":

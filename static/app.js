@@ -62,22 +62,24 @@ const API = {
   flFlowSwitch:  (name) => post('/api/flow/flows/active', { name }),
   flFlowCreate:  (name, copyFrom) => post('/api/flow/flows/create', { name, copy_from: copyFrom }),
   flFlowDel:     (name) => post('/api/flow/flows/delete', { name }),
-  flWpAdd:       (arm, action) => post('/api/flow/teach/waypoint', { arm, action }),
-  flWpDelLast:   (arm, action, n) => post('/api/flow/teach/waypoint/delete', { arm, action, index: n }),
-  flWpOverwrite: (arm, action, index) => post('/api/flow/teach/waypoint/overwrite', { arm, action, index }),
+  flWpAdd:       (arm, action, bin) => post('/api/flow/teach/waypoint', { arm, action, bin: bin || 'L' }),
+  flWpDelLast:   (arm, action, n, bin) => post('/api/flow/teach/waypoint/delete', { arm, action, index: n, bin: bin || 'L' }),
+  flWpOverwrite: (arm, action, index, bin) => post('/api/flow/teach/waypoint/overwrite', { arm, action, index, bin: bin || 'L' }),
   flTitle:       (arm, action, title) => post('/api/flow/action/title', { arm, action, title }),
-  flWpMove:      (arm, action, index, offset) => post('/api/flow/teach/waypoint/move', { arm, action, index, offset }),
-  flCenterMark:  (arm, action, index, center) => post('/api/flow/teach/center_mark', { arm, action, index, center }),
-  flWpWait:      (arm, action, index, seconds) => post('/api/flow/teach/waypoint/wait', { arm, action, index, seconds }),
-  flWpClear:     (arm, action) => post('/api/flow/teach/clear', { arm, action }),
+  flWpMove:      (arm, action, index, offset, bin) => post('/api/flow/teach/waypoint/move', { arm, action, index, offset, bin: bin || 'L' }),
+  flCenterMark:  (arm, action, index, center, bin) => post('/api/flow/teach/center_mark', { arm, action, index, center, bin: bin || 'L' }),
+  flWpWait:      (arm, action, index, seconds, bin) => post('/api/flow/teach/waypoint/wait', { arm, action, index, seconds, bin: bin || 'L' }),
+  flWpClear:     (arm, action, bin) => post('/api/flow/teach/clear', { arm, action, bin: bin || 'L' }),
+  flBinSplit:    (arm, action, split) => post('/api/flow/teach/bin_split', { arm, action, split }),
   flVac:         (b) => post('/api/flow/action/vacuum', b),
-  flPlay:        (arm, action) => post('/api/flow/action/play', { arm, action }),
+  flPlay:        (arm, action, bin) => post('/api/flow/action/play', { arm, action, bin: bin || 'L' }),
   flPlayStop:    () => post('/api/flow/action/play/stop', {}),
   flPlayStatus:  () => fetch('/api/flow/action/play/status').then(r => r.json()),
   flRefRecord:   (arm, which) => post('/api/flow/teach/align_ref', { arm, which }),
   flAlignTest:   (arm, which) => post('/api/flow/align/test', { arm, which }),
   flAlignGoto:   (arm, which) => post('/api/flow/align/goto', { arm, which }),
   flAlignFix:    (arm, which) => post('/api/flow/align/fix', { arm, which }),
+  flObsRecord:   (arm, which) => post('/api/flow/teach/obs_pose', { arm, which }),
   flStart:       (b) => post('/api/flow/start', b),
   flStop:        () => post('/api/flow/stop', {}),
   flStepOk:      () => post('/api/flow/step/confirm', {}),
@@ -2222,6 +2224,8 @@ function flRender(r) {
   document.getElementById('flTolXY').value = g.tol_xy_mm;
   document.getElementById('flTolZ').value = g.tol_z_mm;
   document.getElementById('flMaxCorr').value = g.max_corr_mm;
+  if (g.tol_yaw_deg != null) document.getElementById('flTolYaw').value = g.tol_yaw_deg;
+  if (g.max_corr_deg != null) document.getElementById('flMaxCorrDeg').value = g.max_corr_deg;
   document.getElementById('flIter').value = g.iterations;
   document.getElementById('flFrames').value = g.frames;
   const la = r.config.arms.armleft.align, ra = r.config.arms.armright;
@@ -2242,12 +2246,18 @@ function flRender(r) {
   document.getElementById('flRMk2Size').value = ra.align2.marker_size_mm;
   flRenderGrips(r);
   flCutterRender(r.config);
+  flBinsRender(r.config);
   flPBVSLayout(r.config);
   const cutter = r.config.cutter && r.config.cutter.enabled;
   flRefLine('flRefInfoL', [[cutter ? '裁剪放料区' : '中间件', la.ref]]);
   flRefLine('flRefInfoR', cutter
     ? [['裁剪取料位', ra.align.ref]]
     : [['中间件', ra.align.ref], ['料仓', ra.align2.ref]]);
+  const obsR = ra.align.obs_pose;
+  const oi = document.getElementById('flObsInfoR');
+  if (oi) oi.textContent = (obsR && obsR.joints_deg)
+    ? `观察位:已记录(${obsR.note || ''} ${obsR.created || ''})—— 启动PBVS 先回这里测一次拿 Δ`
+    : '观察位:未记录(回退:就位 B2 点1 兼作观察位)';
   const snapL = la.ref && la.ref.snapshot;
   const imL = document.getElementById('flRefSnapL');
   imL.style.display = snapL ? '' : 'none';
@@ -2260,6 +2270,25 @@ function flRender(r) {
   flRenderActions('armleft', 'flActsLeft', r);
   flRenderActions('armright', 'flActsRight', r);
 }
+
+// 双仓投放面板: 渲染 + 保存(仅右臂 B3/B4/B5 分仓示教)
+function flBinsRender(cfg) {
+  const b = (cfg && cfg.arms && cfg.arms.armright.bins) || {};
+  const en = document.getElementById('flBinsEn');
+  const per = document.getElementById('flBinsPer');
+  if (!en || !per) return;
+  en.checked = !!b.enabled;
+  per.value = b.rounds_per ?? 2;
+}
+document.getElementById('flBinsSave').addEventListener('click', async () => {
+  try {
+    await API.flConfigSet({ armright: { bins: {
+      enabled: document.getElementById('flBinsEn').checked,
+      rounds_per: +document.getElementById('flBinsPer').value || 2 } } });
+    toast('双仓投放配置已存(对下次启动生效)', 'success');
+    flRefresh();
+  } catch (e) { toast(e.message, 'error'); }
+});
 
 // PBVS 参考卡布局随流程形态切换: 流水线3(裁剪)每臂只有一处,R2 料仓站隐藏
 function flPBVSLayout(cfg) {
@@ -2292,6 +2321,132 @@ function flMarker(typeId, idId, dataId) {
     : { type: 'aruco', id: +document.getElementById(idId).value };
 }
 
+// ---- 双仓示教(右臂 B3/B4/B5): 共享段 + ⬅左仓/➡右仓 两列 ----
+// 单个路点行: label=显示编号 / [lo,hi)=本段内允许移动的索引区间(hi=null 到末尾)
+function flWpLine(arm, name, w, label, i, bin, lo, hi) {
+  const p = (w.end_pose && w.end_pose.position) || [0, 0, 0];
+  const line = document.createElement('div');
+  line.className = 'row';
+  line.style.cssText = 'align-items:center;gap:4px;flex-wrap:wrap;';
+  line.innerHTML =
+    `<span class="muted" style="min-width:36px;">点${label}</span>` +
+    `<span class="badge ${w.center ? 'on' : 'off'}" data-op="wpc" data-arm="${arm}" data-act="${name}" data-index="${i}" data-bin="${bin}"` +
+    ` title="标记此点在双臂中心区(中间件上方重叠区)内: 回放走向它前抢中心锁,走到其后第一个非标记点(退出段走完)才交锁;都不标=整段互斥"` +
+    ` style="cursor:pointer;">${w.center ? '●中点' : '○中点'}</span>` +
+    `<span class="badge ${w.wait_s ? 'on' : 'off'}" data-op="wpw" data-arm="${arm}" data-act="${name}" data-index="${i}" data-bin="${bin}" data-wait="${w.wait_s || ''}"` +
+    ` title="到点等待: 回放走到此点(到位验证之后)停留 N 秒再走剩余段 —— 真空触发点同点配了等待时顺序=到点→等→触发真空;点我输入秒数,0=取消"` +
+    ` style="cursor:pointer;">${w.wait_s ? '⏱' + w.wait_s + 's' : '⏱等'}</span>` +
+    `<span class="muted" style="min-width:180px;">[${p.map(v => Math.round(v * 1000)).join(', ')}]mm</span>` +
+    `<span class="muted" style="flex:1;min-width:120px;">${(w.created || '').slice(5)}${w.updated ? ' ↩' + w.updated.slice(5) : ''}</span>` +
+    `<button data-op="wpow" data-arm="${arm}" data-act="${name}" data-index="${i}" data-bin="${bin}" title="移臂到此点要改的姿态后点我,用当前位姿覆盖点${label}">↩覆盖</button>` +
+    `<button data-op="wpdel" data-arm="${arm}" data-act="${name}" data-index="${i}" data-bin="${bin}" title="删除点${label}">✕删</button>` +
+    `<button data-op="wpmv" data-arm="${arm}" data-act="${name}" data-index="${i}" data-bin="${bin}" data-offset="-1"${(i <= lo) ? ' disabled' : ''} title="点${label} 前移一位">↑</button>` +
+    `<button data-op="wpmv" data-arm="${arm}" data-act="${name}" data-index="${i}" data-bin="${bin}" data-offset="1"${(hi !== null && i >= hi - 1) ? ' disabled' : ''} title="点${label} 后移一位">↓</button>`;
+  return line;
+}
+
+// 仓列面板: wps=本列点 / idx0=本列首点在数组内的真实下标(左仓尾段=split)
+function flBinPane(arm, name, title, color, wps, bin, labelOff, idx0, note) {
+  const pane = document.createElement('div');
+  pane.style.cssText =
+    `flex:1;min-width:260px;border:1px dashed ${color};border-radius:6px;` +
+    'padding:4px 8px;font-size:13px;';
+  const bar = document.createElement('div');
+  bar.className = 'row';
+  bar.style.cssText = 'align-items:center;gap:4px;flex-wrap:wrap;';
+  bar.innerHTML =
+    `<b style="color:${color};">${title}</b>` +
+    `<span class="badge ${wps.length ? 'on' : 'off'}">${wps.length}点</span>` +
+    `<button class="primary" data-op="add" data-arm="${arm}" data-act="${name}" data-bin="${bin}">📌加点</button>` +
+    `<button data-op="del" data-arm="${arm}" data-act="${name}" data-bin="${bin}">🗑删末点</button>` +
+    `<button data-op="clear" data-arm="${arm}" data-act="${name}" data-bin="${bin}">🧹清空</button>` +
+    `<button data-op="play" data-arm="${arm}" data-act="${name}" data-bin="${bin}" title="试跑${title}整条路线(共享段+本列尾段)">▶试跑</button>`;
+  pane.appendChild(bar);
+  if (wps.length) {
+    const sub = document.createElement('div');
+    sub.style.cssText = 'display:flex;flex-direction:column;gap:2px;';
+    wps.forEach((w, i) => sub.appendChild(
+      flWpLine(arm, name, w, labelOff + i + 1, idx0 + i, bin,
+               idx0, idx0 + wps.length)));
+    pane.appendChild(sub);
+  } else {
+    const e = document.createElement('div');
+    e.className = 'muted';
+    e.style.cssText = 'margin:2px 0;';
+    e.textContent = note;
+    pane.appendChild(e);
+  }
+  return pane;
+}
+
+// 双仓动作整块: 标题行(真空/说明) + 共享段(可调 split) + 左右两仓列
+function flBinActionRow(arm, name, a) {
+  const wps = a.waypoints || [];
+  const b = a.bins || {};
+  const split = Math.max(0, Math.min(b.split || 0, wps.length));
+  const tail = b.tail || [];
+  const vac = a.vacuum;
+  const box = document.createElement('div');
+  box.style.cssText = 'border:1px solid #345;border-radius:6px;padding:6px 8px;margin:6px 0;';
+  const head = document.createElement('div');
+  head.className = 'row';
+  head.style.cssText = 'align-items:center;flex-wrap:wrap;gap:6px;';
+  head.innerHTML =
+    `<b style="min-width:64px;">${name.split('_')[0]}</b>` +
+    `<input data-op="title" data-arm="${arm}" data-act="${name}" value="${(a.title || '').replace(/"/g, '&quot;')}"` +
+    ` title="步骤说明,可直接修改(回车或点别处保存)"` +
+    ` style="flex:1;min-width:200px;color:#8aa7b0;background:transparent;border:1px dashed #456;border-radius:4px;padding:2px 6px;" />` +
+    `<span class="badge ${wps.length ? 'on' : 'off'}">⬅${wps.length}</span>` +
+    `<span class="badge ${tail.length ? 'on' : 'off'}">➡${tail.length}</span>` +
+    `<label>真空
+       <select data-op="vev" data-arm="${arm}" data-act="${name}">
+         <option value="none"${!vac ? ' selected' : ''}>无</option>
+         <option value="grab"${vac && vac.event === 'grab' ? ' selected' : ''}>吸取</option>
+         <option value="release"${vac && vac.event === 'release' ? ' selected' : ''}>释放</option>
+       </select></label>` +
+    `<label>@
+       <select data-op="vat" data-arm="${arm}" data-act="${name}">
+         <option value="end"${!vac || vac.at === 'end' ? ' selected' : ''}>终点后</option>
+         <option value="start"${vac && vac.at === 'start' ? ' selected' : ''}>起点前</option>
+         <option value="k"${vac && !['start','end'].includes(String(vac.at)) ? ' selected' : ''}>第k点后</option>
+       </select></label>` +
+    `<label>k <input type="number" min="0" step="1" size="2" value="${vac && !['start','end'].includes(String(vac.at)) ? vac.at : 0}"
+              data-op="vk" data-arm="${arm}" data-act="${name}"></label>`;
+  box.appendChild(head);
+  // 共享段(前 split 点两仓共用,B3 默认 2:点3=料仓上方起分仓)
+  const sh = document.createElement('div');
+  sh.style.cssText = 'margin:4px 0 2px 0;';
+  const shBar = document.createElement('div');
+  shBar.className = 'row';
+  shBar.style.cssText = 'align-items:center;gap:4px;flex-wrap:wrap;';
+  shBar.innerHTML =
+    `<span style="color:#6dd49a;">🔗 共享段(两仓同走)</span>` +
+    `<label title="waypoints 前 N 点两仓共用,其后=左仓尾段;B3 录 3 点时 N=2 即点3(料仓上方)起分仓">前
+       <input type="number" min="0" max="${wps.length}" step="1" value="${split}" size="2"
+              data-op="split" data-arm="${arm}" data-act="${name}" /> 点共用</label>` +
+    `<span class="muted">删共享段点会自动跟着缩</span>`;
+  sh.appendChild(shBar);
+  if (split > 0) {
+    const sub = document.createElement('div');
+    sub.style.cssText = 'margin-left:24px;display:flex;flex-direction:column;gap:2px;';
+    wps.slice(0, split).forEach((w, i) => sub.appendChild(
+      flWpLine(arm, name, w, i + 1, i, 'L', 0, split)));
+    sh.appendChild(sub);
+  }
+  box.appendChild(sh);
+  // 左右两仓列(并排)
+  const cols = document.createElement('div');
+  cols.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;margin-top:2px;';
+  cols.appendChild(flBinPane(arm, name, '⬅ 左仓(料仓1)', '#6da8d4',
+                             wps.slice(split), 'L', split, split,
+                             '左仓尾段为空:运行到共享段末点即停(补录放置/退出点)'));
+  cols.appendChild(flBinPane(arm, name, '➡ 右仓(料仓2)', '#d49a6d',
+                             tail, 'R', split, 0,
+                             '空=两仓走同一路线(左仓整条)—— 在右臂摆到右仓位后点『📌加点』补录'));
+  box.appendChild(cols);
+  return box;
+}
+
 function flRenderActions(arm, containerId, r) {
   const el = document.getElementById(containerId);
   el.innerHTML = '';
@@ -2310,8 +2465,21 @@ function flRenderActions(arm, containerId, r) {
     el.appendChild(box);
   }
   const acts = r.config.arms[arm].actions;
+  const binsOn = arm === 'armright'
+    && !!((r.config.arms.armright || {}).bins || {}).enabled;
   for (const name of Object.keys(acts)) {
     const a = acts[name];
+    if (binsOn && ['B3_transfer', 'B4_place', 'B5_extra'].includes(name)) {
+      el.appendChild(flBinActionRow(arm, name, a));
+      const gate = (FL_GATE_AFTER[arm] || {})[name];
+      if (gate) {
+        const sep = document.createElement('div');
+        sep.style.cssText = 'text-align:center;padding:1px 0;font-size:12px;color:#6dd49a;';
+        sep.textContent = `⇣ ${gate}(自动,对准后才播下一个动作) ⇣`;
+        el.appendChild(sep);
+      }
+      continue;
+    }
     const vac = a.vacuum;
     const div = document.createElement('div');
     div.className = 'row';
@@ -2387,37 +2555,47 @@ async function flHandleAction(e) {
   const atSel = row.querySelector('[data-op="vat"]');
   const kIn = row.querySelector('[data-op="vk"]');
   try {
+    const bin = btn.dataset.bin || 'L';       // 双仓: L=左仓 / R=右仓尾段
     if (op === 'add') {
-      const r = await API.flWpAdd(arm, act);
-      toast(`已加路点(共 ${r.count} 点)`, 'success');
+      const r = await API.flWpAdd(arm, act, bin);
+      toast(`已加${bin === 'R' ? '右仓尾段' : ''}路点(共 ${r.count} 点)`, 'success');
       flRefresh();
     } else if (op === 'del') {
       const r = await API.flConfigGet();
-      const n = r.config.arms[arm].actions[act].waypoints.length;
+      const a2 = r.config.arms[arm].actions[act];
+      const n = bin === 'R'
+        ? ((a2.bins || {}).tail || []).length : a2.waypoints.length;
       if (!n) return toast('没有路点', '');
-      await API.flWpDelLast(arm, act, n - 1);
+      await API.flWpDelLast(arm, act, n - 1, bin);
       flRefresh();
     } else if (op === 'clear') {
-      await API.flWpClear(arm, act);
+      if (bin === 'R' && !confirm(`清空 ${act} 的右仓尾段?(左仓路线不动)`)) return;
+      await API.flWpClear(arm, act, bin);
+      flRefresh();
+    } else if (op === 'split') {
+      if (e.type !== 'change') return;
+      await API.flBinSplit(arm, act, +btn.value || 0);
+      toast(`${act.split('_')[0]} 共享前缀已存(前 ${+btn.value || 0} 点两仓共用)`,
+            'success');
       flRefresh();
     } else if (op === 'wpow') {
       const i = +btn.dataset.index;
       if (!confirm(`用当前臂位姿覆盖 ${act} 的点${i + 1}?(其余点不动)`)) return;
-      const r = await API.flWpOverwrite(arm, act, i);
+      const r = await API.flWpOverwrite(arm, act, i, bin);
       toast(`点${i + 1} 已覆盖为当前位姿`, 'success');
       flRefresh();
     } else if (op === 'wpdel') {
       const i = +btn.dataset.index;
       if (!confirm(`删除 ${act} 的点${i + 1}?`)) return;
-      await API.flWpDelLast(arm, act, i);
+      await API.flWpDelLast(arm, act, i, bin);
       flRefresh();
     } else if (op === 'wpmv') {
-      await API.flWpMove(arm, act, +btn.dataset.index, +btn.dataset.offset);
+      await API.flWpMove(arm, act, +btn.dataset.index, +btn.dataset.offset, bin);
       flRefresh();
     } else if (op === 'wpc') {
       const i = +btn.dataset.index;
       const on = btn.classList.contains('on');
-      await API.flCenterMark(arm, act, i, !on);
+      await API.flCenterMark(arm, act, i, !on, bin);
       toast(`点${i + 1} ${on ? '取消中点' : '已标中点'}`, 'success');
       flRefresh();
     } else if (op === 'wpw') {
@@ -2428,7 +2606,7 @@ async function flHandleAction(e) {
       const s = parseFloat(v);
       if (Number.isNaN(s) || s < 0 || s > 60)
         return toast('秒数需在 0~60 之间', 'error');
-      await API.flWpWait(arm, act, i, s);
+      await API.flWpWait(arm, act, i, s, bin);
       toast(`点${i + 1} ${s > 0 ? `到点等 ${s}s` : '取消等待'}`, 'success');
       flRefresh();
     } else if (op === 'title') {
@@ -2438,8 +2616,8 @@ async function flHandleAction(e) {
       await API.flTitle(arm, act, t);
       toast(`${act.split('_')[0]} 说明已更新`, 'success');
     } else if (op === 'play') {
-      await API.flPlay(arm, act);
-      toast('试跑启动(段间可停)', 'success');
+      await API.flPlay(arm, act, bin);
+      toast(`试跑启动${bin === 'R' ? '(右仓路线)' : ''}(段间可停)`, 'success');
       flPoll(true);
     } else if (op === 'vev' || op === 'vat' || op === 'vk') {
       const ev = evSel.value;
@@ -2505,6 +2683,8 @@ document.getElementById('flSaveCfg').addEventListener('click', async () => {
               tol_xy_mm: +document.getElementById('flTolXY').value,
               tol_z_mm: +document.getElementById('flTolZ').value,
               max_corr_mm: +document.getElementById('flMaxCorr').value,
+              tol_yaw_deg: +document.getElementById('flTolYaw').value || 1,
+              max_corr_deg: +document.getElementById('flMaxCorrDeg').value || 10,
               iterations: +document.getElementById('flIter').value,
               frames: +document.getElementById('flFrames').value },
     });
@@ -2681,7 +2861,10 @@ async function flDoRef(arm, which, infoId, snapId) {
 async function flDoTest(arm, which) {
   try {
     const r = await API.flAlignTest(arm, which);
-    toast(`${which}: ${r.key} Δ=[${r.delta_mm}]mm z=${r.z_cam_mm}mm → ${r.verdict}`,
+    const yaw = r.dyaw_cam_deg != null ? ` Δθ=${r.dyaw_cam_deg}°` : '';
+    const rot = r.drot_deg != null && r.drot_deg > 0.5
+      ? ` 码转${r.drot_deg}°绕[${r.drot_axis}]` : '';
+    toast(`${which}: ${r.key} Δ=[${r.delta_mm}]mm${yaw}${rot} z=${r.z_cam_mm}mm → ${r.verdict}`,
           r.verdict.startsWith('PASS') ? 'success' : 'error');
   } catch (e) { toast(e.message, 'error'); }
 }
@@ -2692,7 +2875,10 @@ async function flDoGoto(arm, which) {
   toast(`${label} 回观察位中…(移动+测量约需数秒,期间勿操作)`, 'success');
   try {
     const r = await API.flAlignGoto(arm, which);
-    toast(`${which}: 已回观察位(${r.speed_pct}%) ${r.key} Δ=[${r.delta_mm}]mm → ${r.verdict}`,
+    const yaw = r.dyaw_cam_deg != null ? ` Δθ=${r.dyaw_cam_deg}°` : '';
+    const rot = r.drot_deg != null && r.drot_deg > 0.5
+      ? ` 码转${r.drot_deg}°绕[${r.drot_axis}]` : '';
+    toast(`${which}: 已回观察位(${r.speed_pct}%) ${r.key} Δ=[${r.delta_mm}]mm${yaw}${rot} → ${r.verdict}`,
           r.verdict.startsWith('PASS') ? 'success' : 'error');
   } catch (e) { toast(e.message, 'error'); }
 }
@@ -2700,14 +2886,16 @@ async function flDoGoto(arm, which) {
 async function flDoFix(arm, which) {
   const label = arm === 'armleft' ? '左臂' : '右臂';
   const where = which === 'align' ? '中间件' : '料仓';
-  if (!confirm(`${label} 将回${where}观察位并真跑闸门:测 Δ → 超容差会实际修正(≤ max_corr)→ 复测收敛,修完停在修正后的位置(不回示教点)。单步验证 PBVS 用,确认臂周无障碍物后继续?`)) return;
+  if (!confirm(`${label} 将回${where}观察位并真跑闸门:测 Δ → 超容差会实际修正(平移 ≤ max_corr;角度 ≤ 角度上限,角度修正=工具自转(绕自身Z轴,不动位置、不甩进给方向),先修角度后修平移)→ 复测收敛,修完停在修正后的位置(不回示教点)。单步验证 PBVS 用,确认臂周无障碍物后继续?`)) return;
   toast(`${label} 回观察位并修正中…(移动+测量+修正约 5~20s,期间勿操作)`, 'success');
   try {
     const r = await API.flAlignFix(arm, which);
     const g = r.gate || {};
     const detail = (g.tier === 'T0' || g.tier === 'off')
       ? g.tier : `${g.tier}${g.low_res ? '(低分辨率放行)' : ''} ` +
-        `Δ=${g.dxy_mm}/${g.dz_mm}mm → 残余 ${g.resid_xy_mm}/${g.resid_z_mm}mm` +
+        `Δ=${g.dxy_mm}/${g.dz_mm}mm` +
+        (g.dyaw_cam_deg != null ? ` Δθ=${g.dyaw_cam_deg}°` : '') +
+        ` → 残余 ${g.resid_xy_mm}/${g.resid_z_mm}mm` +
         (g.reanchor_mm ? ` 重锚Δ=${g.reanchor_mm}mm` : '');
     toast(`${which} 修正完成: ${detail}`, 'success');
     document.getElementById('flFixOut').textContent =
@@ -2726,6 +2914,14 @@ document.getElementById('flFixL').addEventListener('click',
   () => flDoFix('armleft', 'align'));
 document.getElementById('flRefR1').addEventListener('click',
   () => flDoRef('armright', 'align'));
+document.getElementById('flObsRecR').addEventListener('click', async () => {
+  try {
+    const r = await API.flObsRecord('armright', 'align');
+    toast(`观察位已记录(${r.obs_pose.created})—— `
+          + '参考也应从这个位置录(视差基准配套)', 'success');
+    flRefresh();
+  } catch (e) { toast(e.message, 'error'); }
+});
 document.getElementById('flTestR1').addEventListener('click',
   () => flDoTest('armright', 'align'));
 document.getElementById('flGotoR1').addEventListener('click',
@@ -2799,7 +2995,7 @@ async function flPoll(force) {
     flBadge(document.getElementById('flFixture'),
             s.fixture === 'FILLED', '中间件:' + (s.fixture || '-'));
     const rd = s.rounds;
-    flBadge(document.getElementById('flRounds'), !!rd && rd.done > 1,
+    flBadge(document.getElementById('flRoundsBadge'), !!rd && rd.done > 1,
             rd && rd.done ? `轮 ${rd.done} · 首轮${rd.first_s ?? '-'}s` +
               (rd.avg_steady_s != null ? ` · 稳态均${rd.avg_steady_s}s` : '')
             : '轮:未完成');

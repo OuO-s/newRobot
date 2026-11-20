@@ -59,16 +59,23 @@ ACTIONS_META = {
         "B2_pick":     {"title": "B2 取料: 对准后下降取料 → 吸住 → 退出中心",
                         "wait": None, "center": True},
         "B3_transfer": {"title": "B3 转移料仓: → 料仓上方(末点=对准观察位)",
-                        "wait": None, "center": False},
+                        "wait": None, "center": False,
+                        # 双仓: 前 split 点两仓共享,其后=左仓尾段(waypoints);
+                        # 右仓尾段在 bins.tail(点3=料仓上方即在此分支)
+                        "bin_split": 2},
         "B4_place":    {"title": "B4 放料仓: 下降放料 → 放开真空 → 收回",
-                        "wait": None, "center": False},
+                        "wait": None, "center": False, "bin_split": 0},
         # B5 附加动作(可选): B4 后、循环末前执行,空路点=整段跳过。
         # 用途不限定(退出行程/二次压合/返回预备位…),路点怎么示教就怎么走。
         "B5_extra":    {"title": "B5 附加动作(可选): B4 放料后执行,空=跳过"
                                    "(退出/压合/返回等,按示教路点回放)",
-                        "wait": None, "center": False},
+                        "wait": None, "center": False, "bin_split": 0},
     },
 }
+
+# 支持双仓尾段示教的动作(仅右臂): waypoints=共享前缀+左仓尾段,
+# bins.tail=右仓尾段。B3 在点3(料仓上方)分支,B4/B5 整段分仓。
+BIN_ACTIONS = ("B3_transfer", "B4_place", "B5_extra")
 
 ARM_KEYS = ("armleft", "armright")
 
@@ -137,6 +144,14 @@ DEFAULTS: dict = {
             # = post_grippers.B2_pick,load_config 自动迁移)
             "post_grippers": {k: dict(POST_GRIP_DEFAULT)
                               for k in POST_GRIP_SLOTS["armright"]},
+            # 双仓投放(2026-11-17 流水线3): 右臂 B3/B4/B5 分左右仓示教,
+            # 运行时按轮次交替 —— 每 rounds_per 轮切一次仓:
+            # 第 1~K 轮→左仓(waypoints),第 K+1~2K 轮→右仓(bins.tail),
+            # 如此往复。K=2 + 轮次填 4 即"前两轮放左仓,后两轮放右仓"。
+            "bins": {
+                "enabled": False,
+                "rounds_per": 2,    # 每仓连续投放轮数
+            },
         },
     },
     # 三档闸门: verify=每轮测一次,达标即过(T1,默认);off=纯回放(T0,极限节拍,
@@ -147,6 +162,9 @@ DEFAULTS: dict = {
         "tol_xy_mm": 2.0,
         "tol_z_mm": 4.0,          # 小码@0.4m 的 PnP z 抖动 ±4mm,3 会压线
         "max_corr_mm": 40.0,
+        "tol_yaw_deg": 1.0,       # 画面角容差(旋转修正,2026-11-18)
+        "max_corr_deg": 10.0,     # 单次旋转修正上限,超此值=码被转/姿态大变
+        "rot_min_deg": 0.5,       # 启动传播旋转死区(小于不重解姿态)
         "iterations": 3,          # 最大修正步数(每步=测一次+修一次)
         "frames": 5,              # 每次测量取几帧中值(多帧压 PnP 抖动)
         "settle_s": 0.8,          # 到观察位后等稳定
@@ -207,13 +225,68 @@ def _fill_actions(cfg: dict) -> dict:
     for arm, acts in ACTIONS_META.items():
         slot = cfg["arms"].setdefault(arm, {})
         actions = slot.setdefault("actions", {})
+        if arm == "armright":
+            b = slot.setdefault("bins", {})
+            b.setdefault("enabled", False)
+            b.setdefault("rounds_per", 2)
         for name, meta in acts.items():
             a = actions.setdefault(name, {})
             a.setdefault("title", meta["title"])
             a.setdefault("waypoints", [])        # [{joints_deg, end_pose, created}]
             a.setdefault("speed", None)          # None=用全局 move.speed
             a.setdefault("vacuum", None)         # {"mode":"on|off","at":"start|end"}
+            if arm == "armright" and name in BIN_ACTIONS:
+                b = a.setdefault("bins", {})
+                b.setdefault("split", int(meta.get("bin_split", 0) or 0))
+                b.setdefault("tail", [])
     return cfg
+
+
+# --------------------------------------------------------------- 双仓
+def effective_waypoints(act: dict, bin: str = "L") -> list:
+    """双仓动作的有效回放路点。
+
+    L = waypoints(共享前缀 + 左仓尾段,即原有语义);
+    R = waypoints[:split] + bins.tail(右仓尾段);
+        tail 为空 → 整条按左仓路线走(两仓共用,readiness 会提示)。
+    """
+    if bin != "R":
+        return act["waypoints"]
+    b = act.get("bins") or {}
+    tail = b.get("tail") or []
+    if not tail:
+        return act["waypoints"]
+    split = int(b.get("split", 0) or 0)
+    return list(act["waypoints"][:split]) + list(tail)
+
+
+def _teach_wps(a: dict, action: str, bin: str) -> list:
+    """示教端点选路点列表: L=waypoints / R=右仓尾段 bins.tail。"""
+    if bin not in ("L", "R"):
+        raise ValueError('bin 只能是 "L"(左仓)/"R"(右仓)')
+    if bin == "R":
+        if action not in BIN_ACTIONS:
+            raise ValueError(f"{action} 不支持右仓尾段(仅 "
+                             f"{'/'.join(BIN_ACTIONS)})")
+        b = a.setdefault("bins", {})
+        b.setdefault("split", 0)
+        return b.setdefault("tail", [])
+    return a["waypoints"]
+
+
+def set_bin_split(arm: str, action: str, split: int) -> dict:
+    """设置双仓动作的共享前缀点数(waypoints 前 split 点两仓共用)。"""
+    if arm != "armright" or action not in BIN_ACTIONS:
+        raise ValueError(f"{action} 不支持双仓(仅 {'/'.join(BIN_ACTIONS)})")
+    cfg = load_config()
+    a = _action(cfg, arm, action)
+    n = len(a["waypoints"])
+    if not (0 <= int(split) <= n):
+        raise ValueError(f"共享前缀需在 0~{n} 点之间(当前 {n} 点)")
+    b = a.setdefault("bins", {})
+    b["split"] = int(split)
+    save_config(cfg)
+    return b
 
 
 def _sanitize_flow_name(name: str) -> str:
@@ -386,6 +459,9 @@ def update_config(patch: dict) -> dict:
         for k in ("tol_xy_mm", "tol_z_mm", "max_corr_mm", "reanchor_max_mm"):
             if k in g:
                 g[k] = float(min(max(float(g[k]), 0.0), 100.0))
+        for k in ("tol_yaw_deg", "max_corr_deg", "rot_min_deg"):
+            if k in g:
+                g[k] = float(min(max(float(g[k]), 0.0), 45.0))
         for k in ("iterations", "frames"):
             if k in g:
                 g[k] = int(min(max(int(g[k]), 1), 5))
@@ -479,6 +555,14 @@ def update_config(patch: dict) -> dict:
                 }
                 for kk in [k for k in v if k.startswith("valve_")]:
                     slot[vk][kk] = v[kk]      # 电磁阀参数原样透传(接入后用)
+        if arm == "armright" and "bins" in p:
+            b = p["bins"] or {}
+            cur = slot.setdefault("bins",
+                                  dict(DEFAULTS["arms"]["armright"]["bins"]))
+            if "enabled" in b:
+                cur["enabled"] = bool(b["enabled"])
+            if "rounds_per" in b:
+                cur["rounds_per"] = int(min(max(int(b["rounds_per"]), 1), 99))
         if "post_grippers" in p:
             pg_in = p["post_grippers"] or {}
             pg = slot.setdefault("post_grippers", {})
@@ -536,33 +620,39 @@ def handeye_info(arm: str) -> dict:
 
 # ---------------------------------------------------------------- 动作
 def record_waypoint(arm: str, action: str, joints_deg: list,
-                    end_pose: dict) -> dict:
+                    end_pose: dict, bin: str = "L") -> dict:
     cfg = load_config()
     a = _action(cfg, arm, action)
+    wps = _teach_wps(a, action, bin)
     wp = {"joints_deg": [round(float(v), 3) for v in joints_deg],
           "end_pose": end_pose,
           "created": time.strftime("%Y-%m-%d %H:%M:%S")}
-    a["waypoints"].append(wp)
+    wps.append(wp)
     save_config(cfg)
     return wp
 
 
-def delete_waypoint(arm: str, action: str, index: int) -> None:
+def delete_waypoint(arm: str, action: str, index: int, bin: str = "L") -> None:
     cfg = load_config()
     a = _action(cfg, arm, action)
-    wps = a["waypoints"]
+    wps = _teach_wps(a, action, bin)
     if not (0 <= index < len(wps)):
         raise ValueError(f"路点序号 {index} 越界(共 {len(wps)} 个)")
     wps.pop(index)
+    if bin == "L" and a.get("bins"):
+        # 左仓段删点要维护共享前缀: 删的是共享段点 → split 跟着缩 1
+        split = int(a["bins"].get("split", 0) or 0)
+        if index < split:
+            a["bins"]["split"] = max(0, split - 1)
     save_config(cfg)
 
 
 def overwrite_waypoint(arm: str, action: str, index: int, joints_deg: list,
-                       end_pose: dict) -> dict:
+                       end_pose: dict, bin: str = "L") -> dict:
     """用当前位姿覆盖第 index 个路点(其余路点与顺序不动)。
-    created 保留原示教时间,另记 updated。"""
+    created 保留原示教时间,另记 updated。bin=R 覆盖右仓尾段点。"""
     cfg = load_config()
-    wps = _action(cfg, arm, action)["waypoints"]
+    wps = _teach_wps(_action(cfg, arm, action), action, bin)
     if not (0 <= index < len(wps)):
         raise ValueError(f"路点序号 {index} 越界(共 {len(wps)} 个)")
     wp = {"joints_deg": [round(float(v), 3) for v in joints_deg],
@@ -574,14 +664,15 @@ def overwrite_waypoint(arm: str, action: str, index: int, joints_deg: list,
     return wp
 
 
-def mark_center(arm: str, action: str, index: int, center: bool) -> dict:
+def mark_center(arm: str, action: str, index: int, center: bool,
+                bin: str = "L") -> dict:
     """设置/取消路点的"中点"标记(双臂中心互斥的路点级细化)。
 
     center=True: 该点在中心区(中间件上方重叠体积)内 —— 回放时走向它
     之前抢中心锁,走到其后第一个非标记点(退出段走完)才交锁。
     取消=移除键,保持旧配置文件干净(缺键=非中点)。"""
     cfg = load_config()
-    wps = _action(cfg, arm, action)["waypoints"]
+    wps = _teach_wps(_action(cfg, arm, action), action, bin)
     if not (0 <= index < len(wps)):
         raise ValueError(f"路点序号 {index} 越界(共 {len(wps)} 个)")
     if center:
@@ -592,13 +683,14 @@ def mark_center(arm: str, action: str, index: int, center: bool) -> dict:
     return wps[index]
 
 
-def set_waypoint_wait(arm: str, action: str, index: int, seconds: float) -> dict:
+def set_waypoint_wait(arm: str, action: str, index: int, seconds: float,
+                      bin: str = "L") -> dict:
     """设置/取消路点的"到点等待"(回放到该点后停留 N 秒再走剩余段)。
 
     用途: 吸/放前稳一稳、等真空建立、等抖动衰减等。
     seconds<=0: 取消(移除键,保持旧配置文件干净,缺键=不等)。"""
     cfg = load_config()
-    wps = _action(cfg, arm, action)["waypoints"]
+    wps = _teach_wps(_action(cfg, arm, action), action, bin)
     if not (0 <= index < len(wps)):
         raise ValueError(f"路点序号 {index} 越界(共 {len(wps)} 个)")
     if seconds > 0:
@@ -611,28 +703,44 @@ def set_waypoint_wait(arm: str, action: str, index: int, seconds: float) -> dict
     return wps[index]
 
 
-def move_waypoint(arm: str, action: str, index: int, offset: int) -> None:
+def move_waypoint(arm: str, action: str, index: int, offset: int,
+                  bin: str = "L") -> None:
     """与相邻路点交换位置(offset=-1 前移 / +1 后移)。"""
     if offset not in (-1, 1):
         raise ValueError("offset 只能是 -1/+1")
     cfg = load_config()
-    wps = _action(cfg, arm, action)["waypoints"]
+    a = _action(cfg, arm, action)
+    wps = _teach_wps(a, action, bin)
     if not (0 <= index < len(wps)):
         raise ValueError(f"路点序号 {index} 越界(共 {len(wps)} 个)")
     j = index + offset
     if not (0 <= j < len(wps)):
         raise ValueError(f"点 {index + 1} 已在序列{'头' if offset < 0 else '尾'},"
                          f"无法再{'前移' if offset < 0 else '后移'}")
+    if bin == "L" and a.get("bins"):
+        # 左仓段不允许把点移过共享前缀边界(共享段/左仓尾段各归各)
+        split = int(a["bins"].get("split", 0) or 0)
+        if min(index, j) < split <= max(index, j):
+            raise ValueError(f"点 {index + 1} 不能跨共享前缀边界移动"
+                             f"(前 {split} 点两仓共用)")
     wps[index], wps[j] = wps[j], wps[index]
     save_config(cfg)
 
 
-def clear_action(arm: str, action: str) -> None:
+def clear_action(arm: str, action: str, bin: str = "L") -> None:
+    """清空动作路点。bin=R 只清右仓尾段;L 清 waypoints(右仓尾段保留)。"""
     cfg = load_config()
-    _action(cfg, arm, action)["waypoints"] = []
-    if arm == "armleft" and action == "A2_place":
-        pass        # 对准参考不随路点清除(观察位在 A1 末点)
+    a = _action(cfg, arm, action)
+    _teach_wps(a, action, bin)[:] = []
+    if bin == "L" and a.get("bins"):
+        a["bins"]["split"] = 0   # waypoints 空=无共享段
     save_config(cfg)
+
+
+def a_bins(cfg: dict, arm: str, action: str) -> dict:
+    """动作的双仓配置(共享前缀/右仓尾段),无则空 dict。"""
+    return ((cfg.get("arms", {}).get(arm, {})
+             .get("actions", {}).get(action, {}) or {}).get("bins")) or {}
 
 
 def _action(cfg: dict, arm: str, action: str) -> dict:
@@ -758,6 +866,21 @@ def readiness(cfg: dict | None = None, only: str | None = None) -> dict:
                             f"流程预期 {want}")
     if want_r and not ra["actions"]["B0_pre"]["waypoints"]:
         warnings.append("右臂 B0 预备位为空(可选):配好后取料衔接更快")
+    # —— 双仓投放(流水线3): 轮次按仓分配 + 右仓尾段完整性 ——
+    rb = ra.get("bins") or {}
+    if want_r and rb.get("enabled"):
+        K = int(rb.get("rounds_per", 2) or 2)
+        warnings.append(f"双仓投放已启用: 每 {K} 轮切一仓交替"
+                        f"(第 1~{K} 轮→左仓,第 {K + 1}~{2 * K} 轮→右仓,"
+                        "如此往复;右臂测试同规则)")
+        for name in ("B3_transfer", "B4_place", "B5_extra"):
+            act = ra["actions"][name]
+            if not act["waypoints"]:
+                continue          # 动作整个为空已有上面的提示
+            if not ((act.get("bins") or {}).get("tail") or []):
+                warnings.append(f"右臂 {name} 右仓路点未示教:"
+                                "右仓轮将走左仓同一路线(两仓共用点位)"
+                                " —— 在示教区『➡右仓』列补录")
     # —— 路点级"中点"标记的完整性提示(有标记才查) ——
     for arm, name, want in (("armleft", "A2_place", want_l),
                             ("armright", "B2_pick", want_r)):
@@ -826,10 +949,12 @@ def _has_pyzbar() -> bool:
 
 
 def action_hash(cfg: dict, arm: str, action: str) -> str:
-    """动作路点内容的短 hash —— 对准参考绑定它,改动作可提示复验。"""
+    """动作路点内容的短 hash —— 对准参考绑定它,改动作可提示复验。
+    双仓动作把右仓尾段一并纳入(任一仓重示教都算改动)。"""
     import hashlib
-    wps = cfg["arms"][arm]["actions"][action]["waypoints"]
-    blob = json.dumps(wps, sort_keys=True).encode()
+    a = cfg["arms"][arm]["actions"][action]
+    blob = json.dumps([a["waypoints"], (a.get("bins") or {}).get("tail")],
+                      sort_keys=True).encode()
     return hashlib.sha1(blob).hexdigest()[:8]
 
 
@@ -841,4 +966,17 @@ def save_align_ref(arm: str, which: str, ref: dict) -> None:
     if slot is None or key not in slot:
         raise ValueError(f"{arm} 没有 {key} 槽位")
     slot[key]["ref"] = ref
+    save_config(cfg)
+
+
+def save_obs_pose(arm: str, which: str, pose: dict) -> None:
+    """记录启动PBVS的独立观察位(槽位 obs_pose,2026-11-18)。
+    右臂流水线3 默认=B5点1(初始位):启动先回这里测一次拿 Δ,
+    不再借道 B2 点1 —— 参考也从这里录,视差基准才配套。"""
+    cfg = load_config()
+    key = "align" if which == "align" else "align2"
+    slot = cfg["arms"].get(arm)
+    if slot is None or key not in slot:
+        raise ValueError(f"{arm} 没有 {key} 槽位")
+    slot[key]["obs_pose"] = pose
     save_config(cfg)

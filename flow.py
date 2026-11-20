@@ -74,6 +74,7 @@
 """
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections import deque
@@ -85,11 +86,79 @@ import flow_store
 import pick_store
 import speed_store
 from cutter_client import CutterAborted, CutterError, CutterFlow
-from cartesian import cartesian_delta_move, plan_cartesian_path
+from cartesian import (cartesian_delta_move, plan_cartesian_path,
+                       _R_to_quat as R_to_quat)
 from depth_provider import DepthError, DepthSession, ensure_ros_env
 from flow_align import MarkerFinder, measure_marker_base
-from pick_flow import (quat_to_rpy_deg, rpy_deg_to_R, scan_once, T_from)
+from pick_flow import (quat_to_R, quat_to_rpy_deg, R_to_rpy_deg,
+                       rpy_deg_to_R, scan_once, T_from)
 from robot_client import RobotError, TianlianRobot
+
+
+def _wrap180(deg: float) -> float:
+    """角度差归一到 (-180, 180]。"""
+    return (float(deg) + 180.0) % 360.0 - 180.0
+
+
+def _Rz(deg: float) -> np.ndarray:
+    """绕基座 Z 轴旋转矩阵(度)。"""
+    return rpy_deg_to_R(0.0, 0.0, deg)
+
+
+def _rotate_pose_about(pos, quat, center, dyaw_deg):
+    """位姿绕 center(基座系 3D 点)转 dyaw_deg°(基座 Z)。
+
+    仅 _Rz 特例保留;启动PBVS传播用 _rigid_pose(实测完整旋转,任意轴)。
+    quat 传 [x,y,z,w] 占位(如 [0,0,0,1])可只算位置。
+    返回 (新位置, 新姿态四元数)。"""
+    R = _Rz(dyaw_deg)
+    p = R @ (np.asarray(pos, float) - np.asarray(center, float)) \
+        + np.asarray(center, float)
+    q = R_to_quat(R @ quat_to_R(*[float(v) for v in quat]))
+    return p, q
+
+
+def _rigid_pose(pos, quat, center, R):
+    """位姿按实测旋转矩阵 R(基座系)绕 center 做刚体变换。
+
+    启动PBVS传播专用: 码/工装整体转了,转轴是什么就是什么(竖直面码
+    绕自身法向转、台面工装绕竖直转,…),不再假设基座 Z —— 2026-11-18
+    用户实测"应用的旋转轴不对"的修正: 旧版只取基座系 yaw 分量绕竖直
+    轴转,竖直面码的 yaw 投影病态(假读数可达几十度)且轴假设也错。
+    quat 传 [x,y,z,w] 占位可只算位置。返回 (新位置, 新姿态四元数)。"""
+    c = np.asarray(center, float)
+    p = np.asarray(R, float) @ (np.asarray(pos, float) - c) + c
+    q = R_to_quat(np.asarray(R, float)
+                  @ quat_to_R(*[float(v) for v in quat]))
+    return p, q
+
+
+def _rot_angle_axis(R):
+    """旋转矩阵 → (角度°, 单位轴向量)。角度∈[0,180]。
+
+    轴 = 反对称部分 v=[R32−R23, R13−R31, R21−R12](‖v‖=2sinθ);
+    θ≈180° 时 v→0(该量级超上限必拒,仅展示用,取对角最大方向)。"""
+    R = np.asarray(R, float)
+    cos_h = (np.trace(R) - 1.0) / 2.0
+    ang = math.degrees(math.acos(max(-1.0, min(1.0, cos_h))))
+    v = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+    n = float(np.linalg.norm(v))
+    if n > 1e-9:
+        return ang, v / n
+    if ang < 1e-6:
+        return 0.0, np.array([0.0, 0.0, 1.0])
+    axis = np.zeros(3)
+    axis[int(np.argmax(np.diag(R)))] = 1.0
+    return ang, axis
+
+
+def _roll_tool_quat(quat, deg):
+    """工具系自转 deg°(绕工具自身 Z 轴,右乘)—— 只动腕部自转角,
+    进给方向(工具轴指向)一个分量都不动,法兰中心在工具轴上位置也不动。
+    2026-11-18 实机数据: 相机光轴与工具Z夹角仅 1.5°(az=0.9997),
+    画面角差 ≈ 工具自转角,绕基座 Z 修会把水平的工具轴甩出去(修正不对
+    的根因),改为纯工具自转。返回新姿态四元数 [x,y,z,w]。"""
+    return R_to_quat(quat_to_R(*[float(v) for v in quat]) @ _Rz(deg))
 
 
 class _Abort(Exception):
@@ -254,12 +323,20 @@ class ArmLoop:
         self._gate_offset: np.ndarray | None = None
         # 启动PBVS(gate.mode=startup): 首个启用的闸门收敛后 Δ 定标,
         # 全臂动作路点平移重解成关节存 _shifted_wps(仅本次运行);
-        # _startup_delta 非 None(含 Δ≈0)即后续闸门全跳过
+        # _startup_delta 非 None(含 Δ≈0)即后续闸门全跳过。
+        # 双仓动作左右两套路点各重解一份,键=(动作名, 仓)
         self._startup_delta: np.ndarray | None = None
-        self._shifted_wps: dict[str, list] | None = None
+        self._shifted_wps: dict[tuple, list] | None = None
         # 启动模式实测的基座系码位移 d=p_now−p_ref(比 Δ锚干净,见
         # _latch_startup_delta 的说明);每次闸门测量都会刷新
         self._startup_meas_d: np.ndarray | None = None
+        # 同一次测量的基座系码角差(工件真实转角,与臂到位无关)与
+        # 参考码位置(旋转传播的转动中心);旋转修正 2026-11-18
+        self._startup_meas_dtheta: float | None = None
+        self._startup_meas_dR: np.ndarray | None = None
+        self._startup_meas_daxis: np.ndarray | None = None
+        self._startup_rot_warned = False
+        self._startup_meas_marker: np.ndarray | None = None
         # 本轮循环的日志累积(循环起点重置,_mark_cycle 汇总落盘)
         self._cycle_phases: list[list] = []        # [[phase, 耗时s], ...]
         self._cycle_actions: list[dict] = []
@@ -318,10 +395,11 @@ class ArmLoop:
         finally:
             self.runner.handoff.exit_center(self.arm)
 
-    def run_once(self, action: str):
-        """单动作试跑(网页『▶试跑』):异常处理与循环同款。"""
+    def run_once(self, action: str, bin: str = "L"):
+        """单动作试跑(网页『▶试跑』):异常处理与循环同款。
+        bin=L/R=双仓动作试跑哪一仓的路线(非双仓动作忽略)。"""
         try:
-            self.play_action(action)
+            self.play_action(action, bin=bin)
         except _Abort:
             self.set_phase("aborted")
             self.say("⛔ 试跑软停,臂停在当前位")
@@ -366,12 +444,35 @@ class ArmLoop:
             raise RobotError("关节角读取失败")
         return [float(v) for v in q]
 
+    # ------------------------------------------------------------ 双仓
+    def _bins_on(self) -> bool:
+        """右臂双仓投放启用(arms.armright.bins.enabled)。"""
+        return (self.arm == "armright"
+                and bool((self.runner.cfg["arms"].get("armright")
+                          .get("bins") or {}).get("enabled")))
+
+    def _cur_bin(self, name: str | None = None) -> str:
+        """本轮循环投放仓: 每 rounds_per 轮切一仓交替(L→R→L→…)。
+        cycles=已完成循环数(本轮开始时),第 1 轮 cycles=0 → 前进左仓。
+        双仓停用/动作不支持 → 恒 "L"(原单仓行为)。"""
+        if not self._bins_on():
+            return "L"
+        if name is not None and name not in flow_store.BIN_ACTIONS:
+            return "L"
+        k = int((self.runner.cfg["arms"]["armright"].get("bins") or {})
+                .get("rounds_per", 2) or 2)
+        return "L" if (self.cycles // k) % 2 == 0 else "R"
+
+    def _effective_wps(self, act: dict, bin: str) -> list:
+        """双仓动作的有效回放路点(共享前缀+对应仓尾段,见 flow_store)。"""
+        return flow_store.effective_waypoints(act, bin)
+
     # ------------------------------------------------------------ 运动
     def _mv_cfg(self) -> dict:
         return self.runner.cfg["move"]
 
     def play_action(self, name: str, reanchor: bool = False,
-                    wp_range=None):
+                    wp_range=None, bin: str | None = None):
         """示教动作回放: 关节路点序列 + 段后验证补走 + 中途真空触发。
 
         动作配置 vacuum = {"event": "grab"|"release", "at": "start"|k|"end"},
@@ -385,13 +486,22 @@ class ArmLoop:
         不落在本段的自动不触发;"end"只在末段、"start"只在首段生效;
         该段路点为空时静默跳过(不动挂起的闸门Δ,后续段还要用)。
 
+        bin="L"/"R"(双仓动作): 回放哪一仓的路线。缺省=按轮次自动
+        (_cur_bin: 每 rounds_per 轮切一仓);试跑(run_once)显式指定。
+        右仓无尾段时 effective=整条左仓路线(flow_store.effective_waypoints)。
+
         reanchor=True(闸门后的 A2/B2/B4 用): 若紧前的对准闸门留有平移
         Δ锚,各路点示教位姿 +Δ锚 后按笛卡尔逐点走,让视觉修正传导进
         下降/退出轨迹;Δ 缺失或 < reanchor_min_mm 时退回纯关节回放。
         """
         meta = flow_store.ACTIONS_META[self.arm][name]
         act = self.runner.cfg["arms"][self.arm]["actions"][name]
-        wps = act["waypoints"]
+        bin = bin or self._cur_bin(name)
+        dual = bin == "R" or (self._bins_on()
+                              and name in flow_store.BIN_ACTIONS)
+        bin_txt = ("[➡右仓] " if bin == "R" else
+                   ("[⬅左仓] " if dual else ""))
+        wps = self._effective_wps(act, bin)
         if not wps:
             # 空动作=跳过(2026-11-09:部分示教也要能跑测试;真空触发/
             # 段后对准都挂在本段路点上,一并自然失效)。臂不动。
@@ -400,7 +510,10 @@ class ArmLoop:
             self.runner.runlog.event("action_skip", self.arm, action=name,
                                      reason="no_waypoints")
             return
-        shifted = (self._shifted_wps or {}).get(name)
+        shifted = (self._shifted_wps or {}).get((name, bin))
+        if shifted is None and bin == "R":
+            # 右仓尾段为空 → effective=左仓路线,平移键也落左仓那份
+            shifted = (self._shifted_wps or {}).get((name, "L"))
         if shifted is not None:
             # 启动PBVS: 换成平移后的关节路点;回放/补走/等待/中点锁/
             # 真空时序机制全部不变 —— 仍是关节轨迹,只是刚体平移过
@@ -436,10 +549,10 @@ class ArmLoop:
             else:
                 off = np.asarray(self._gate_offset, float)
         self.set_phase(name)
-        self.say((f"{name}: 重锚回放 {len(wps)} 点"
+        self.say((f"{name}{bin_txt}: 重锚回放 {len(wps)} 点"
                   f"(闸门Δ={np.round(off * 1000.0, 1).tolist()}mm)")
                  if off is not None else
-                 (f"{name}: 回放 {len(wps)} 个路点"
+                 (f"{name}{bin_txt}: 回放 {len(wps)} 个路点"
                   + (f"(真空{ '吸' if vac['event'] == 'grab' else '断'}"
                      f" @ {vac.get('at', 'end')})" if vac else "")))
 
@@ -448,6 +561,7 @@ class ArmLoop:
         rec = {"action": name, "cycle": self.cycles + 1,
                "t_start": flow_runlog.iso(), "speed_pct": speed,
                "waypoints": len(wps),
+               "bin": (bin if dual else None),
                "wp_range": (list(wp_range) if wp_range is not None else None),
                "mode": "reanchor" if off is not None else "joint",
                "startup_shift_mm": ([round(float(v) * 1000.0, 2)
@@ -727,16 +841,24 @@ class ArmLoop:
                          axis_fallback=True)
 
     # ------------------------------------------------------------ 对准闸门
-    def align_gate(self, which: str = "align") -> dict:
-        """三档对准闸门。which: align(中间件) / align2(料仓,仅右臂)。"""
+    def align_gate(self, which: str = "align",
+                   where: str | None = None) -> dict:
+        """三档对准闸门。which: align(中间件) / align2(料仓,仅右臂)。
+        where: 日志里的站名,调用方可传(裁剪方案传"裁剪取料位"等),
+        默认按 which 推经典站名。"""
         gate = self.runner.cfg["gate"]
         if gate.get("mode") == "startup":
             # 启动模式一次定标,PnP 的 z 噪声会原样进 Δ 影响全程:
             # 帧数至少 9(verify 逐站修可以容忍抖,一次性定标不行)
             gate = {**gate, "frames": max(int(gate["frames"]), 9)}
+        # 旋转修正(2026-11-18): 画面角(相机系)判"看起来正不正",
+        # 基座系码角专测"码/工件本身转没转"(与臂怎么到位无关)。
+        # 老参考没存角度 → 只修平移,不炸
+        tol_yaw = float(gate.get("tol_yaw_deg", 1.0))
+        max_dyaw = float(gate.get("max_corr_deg", 10.0))
         self._gate_offset = None                 # 每次闸门重置,成功才留 Δ锚
         slot = self.runner.cfg["arms"][self.arm].get(which) or {}
-        where = "中间件" if which == "align" else "料仓"
+        where = where or ("中间件" if which == "align" else "料仓")
         if not slot.get("enabled", True):
             self.say(f"闸门[{where}]: 配置停用,直接放行")
             return {"tier": "off"}
@@ -779,6 +901,24 @@ class ArmLoop:
             T_ref = T_from(ep_ref["position"], ep_ref["orientation"])
             ref_pc = (np.linalg.inv(T_ref @ T_x)
                       @ np.array([*ref["p_base"], 1.0]))[:3]
+        ref_yaw_cam = ref.get("yaw_cam_deg")
+        ref_yaw_base = ref.get("yaw_base_deg")
+        # az = 工具Z 与相机光轴的夹角余弦(手眼装好后是常数):
+        # 画面角差 → 工具自转角的换算系数 φ=Δθ/az(推导: 末端绕工具Z
+        # 转 φ,相机绕自身光轴转 φ·az,静态码的实测 yaw_cam 变 −φ·az)。
+        # az≈±1 = 光轴沿工具轴(armright 实测 0.9997),单轴自转模型精确;
+        # |az|<0.5 = 相机侧装,画面角掺了别的轴分量,旋转修正不适用。
+        az = float((T_x[:3, :3].T @ np.array([0.0, 0.0, 1.0]))[2])
+        rot_ok = (ref_yaw_cam is not None and ref_yaw_base is not None
+                  and abs(az) >= 0.5)
+        if not rot_ok:
+            if ref_yaw_cam is None or ref_yaw_base is None:
+                self.say(f"闸门[{where}]: 参考未存码角度(旧版参考),"
+                         "本次只修平移不修角度 —— 重录参考后启用旋转修正")
+            else:
+                self.say(f"闸门[{where}]: 相机光轴与工具Z夹角 "
+                         f"{np.degrees(np.arccos(min(1.0, abs(az)))):.0f}°"
+                         "(侧装),旋转修正不适用 —— 本次只修平移不修角度")
 
         def _pass(tier, head, **extra):
             """收敛放行公共出口: 重锚Δ记账(含过大拒走保护)+日志+grec。
@@ -809,9 +949,28 @@ class ArmLoop:
                         "工装不配套(先录参考后改示教?工装被挪?),"
                         "请在观察位重录参考后再跑")
                 self._gate_offset = off
+            # verify 模式的重锚只平移不跟转: 码真转了要喊出来,别让
+            # B2 拿示教姿态怼转过的工件(startup 模式有旋转传播,不受限)。
+            # 判据用完整 ΔR 角度(任意轴)—— 基座 yaw 投影对竖直面码
+            # 病态(假读数可达几十度,11-18 15:52 的 -63° 即此),勿再用
+            if gate["mode"] != "startup" and dR_pass is not None:
+                ang_p, ax_p = _rot_angle_axis(dR_pass)
+                if ang_p > tol_yaw:
+                    head += (f" ⚠码转了{ang_p:.1f}°绕"
+                             f"{np.round(ax_p, 1).tolist()},"
+                             "verify 重锚只平移不跟转 —— 建议切 startup"
+                             "或重示教")
             self.say(head + (f",重锚Δ={ren}mm" if ren else ""))
             grec = {"tier": tier, "which": which,
                     "dxy_mm": round(dxy, 1), "dz_mm": round(dz, 1),
+                    "dyaw_cam_deg": (round(dyaw_cam, 1)
+                                     if dyaw_cam is not None else None),
+                    "dyaw_base_deg": (round(dyaw_base, 1)
+                                      if dyaw_base is not None else None),
+                    "drot_deg": (round(_rot_angle_axis(dR_pass)[0], 1)
+                                 if dR_pass is not None else None),
+                    "drot_axis": (np.round(_rot_angle_axis(dR_pass)[1], 2)
+                                  .tolist() if dR_pass is not None else None),
                     "resid_xy_mm": round(cxy, 1), "resid_z_mm": round(cz, 1),
                     "reanchor_mm": ren,
                     "duration_s": round(time.monotonic() - m0, 3)}
@@ -832,6 +991,23 @@ class ArmLoop:
                                     T_from(ep["position"], ep["orientation"]),
                                     T_x, frames=int(gate["frames"]))
             d = np.array(m["p_base"]) - np.array(ref["p_base"])
+            # 画面角差 = 到位姿态差 + 工件真实转角的合成(相机系);
+            # 基座系码角差 = 只有工件真实转角(与臂怎么到位无关)
+            dyaw_cam = (_wrap180(float(m["yaw_cam_deg"]) - float(ref_yaw_cam))
+                        if rot_ok and m.get("yaw_cam_deg") is not None
+                        else None)
+            dyaw_base = (_wrap180(float(m["yaw_base_deg"])
+                                  - float(ref_yaw_base))
+                         if rot_ok and m.get("yaw_base_deg") is not None
+                         else None)
+            # 码/工装真实姿态变化(完整旋转,任意轴;与臂怎么到位无关)。
+            # 基座 yaw 投影对竖直面码病态(假读数可达几十度,11-18 15:52
+            # 的 -63° 即此),一切下游消费(传播锁存/verify 提示)都用
+            # 这个 ΔR,勿再用 yaw
+            dR_pass = (np.array(m["R_marker_base"], float)
+                       @ np.array(ref["R_marker_base"], float).T
+                       if (m.get("R_marker_base") is not None
+                           and ref.get("R_marker_base")) else None)
             if gate["mode"] == "startup":
                 # 启动PBVS钉住"实测码位移"(基座系):比 Δ锚(当前末端−
                 # 示教末点,含回放残余+T2 修正)更干净 —— 新鲜回放的
@@ -839,6 +1015,43 @@ class ArmLoop:
                 # (11-13 流水线2实测: 应用端 0.0~0.01° 精确,残差全在
                 # Δ 估计本身)
                 self._startup_meas_d = np.asarray(d, float).copy()
+                # 旋转传播同理,只钉"码/工装本身的真实姿态变化"。到位
+                # 姿态差不进传播 —— 下游路点回放示教关节,姿态本来就对。
+                # 用完整旋转矩阵 ΔR = R_now @ R_ref⁻¹,不假设旋转轴
+                # (2026-11-18 用户实测: 竖直面码绕自身法向转,旧版只取
+                # 基座 yaw 绕竖直轴转 → 轴错+yaw 投影病态假读数几十度)。
+                # 旋转中心 = 参考码位置(不是当前实测位!): 绕参考点转
+                # 再叠加实测位移 d,对一般刚体运动是精确分解
+                if (m.get("R_marker_base") is not None
+                        and ref.get("R_marker_base")):
+                    dR = dR_pass
+                    dR_ang, dR_axis = _rot_angle_axis(dR)
+                    if dR_ang > max_dyaw:
+                        # 巨大假读数/码真被撞歪,一律拒绝传播(分型提示),
+                        # 绝不带几十度的"修正"去重解全臂路点
+                        self.runner.runlog.event(
+                            "gate_fail", self.arm, which=which, step=step,
+                            reason="prop_rot_over_limit",
+                            dR_deg=round(dR_ang, 2),
+                            dR_axis=[round(float(v), 3) for v in dR_axis],
+                            limit_deg=max_dyaw,
+                            duration_s=round(time.monotonic() - m0, 3))
+                        raise ValueError(
+                            f"闸门[{where}] 拒绝传播旋转: 码姿态变化 "
+                            f"{dR_ang:.1f}° > 上限 {max_dyaw:.0f}°"
+                            f"(轴 {np.round(dR_axis, 2).tolist()})"
+                            " —— 码被撞歪/测量翻转/参考与现场不配套,"
+                            "人工确认后重记参考")
+                    self._startup_meas_dR = dR
+                    self._startup_meas_dtheta = dR_ang
+                    self._startup_meas_daxis = dR_axis
+                elif not self._startup_rot_warned:
+                    self._startup_rot_warned = True
+                    self.say(f"闸门[{where}]: 参考未存码姿态矩阵"
+                             "(旧版参考),旋转不传播(仅平移)"
+                             " —— 重录参考后启用")
+                self._startup_meas_marker = np.asarray(
+                    ref["p_base"], float).copy()
             dxy = float(np.hypot(d[0], d[1])) * 1000
             dz = float(abs(d[2])) * 1000
             key_ok = m["key"] == ref.get("key")
@@ -846,11 +1059,20 @@ class ArmLoop:
             self.say(f"测量{step}: Δxy={dxy:.1f}mm Δz={dz:.1f}mm "
                      f"z_cam={m['z_cam_mm']:.0f}mm 帧{fu}/{gate['frames']}"
                      f" key={m['key']}"
+                     + (f" Δθ画面={dyaw_cam:+.1f}°"
+                        f"/θ基座={dyaw_base:+.1f}°"
+                        if dyaw_cam is not None else "")
+                     + (" ⚠角度超容差" if dyaw_cam is not None
+                        and abs(dyaw_cam) > tol_yaw else "")
                      + (" ⚠解码帧少,读数可能抖" if fu < 3 else "")
                      + ("" if key_ok else " ⚠码身份与参考不一致!"))
             self.runner.runlog.event(
                 "gate_measure", self.arm, which=which, step=step,
                 dxy_mm=round(dxy, 1), dz_mm=round(dz, 1),
+                dyaw_cam_deg=(round(dyaw_cam, 2) if dyaw_cam is not None
+                              else None),
+                dyaw_base_deg=(round(dyaw_base, 2) if dyaw_base is not None
+                               else None),
                 z_cam_mm=m["z_cam_mm"], key=m["key"],
                 frames_used=m.get("frames_used"),
                 spread_mm=m.get("spread_mm"))
@@ -916,10 +1138,14 @@ class ArmLoop:
                 crit = "稳定性"
                 ok = cxy <= gate["tol_xy_mm"] and cz <= gate["tol_z_mm"]
                 corr = dd
+            # 收敛判据 = 平移 + 画面角(老参考没角度时只看平移)
+            ok = ok and (dyaw_cam is None or abs(dyaw_cam) <= tol_yaw)
             if ok:
                 head = (f"闸门[{where}]: ✓ "
                         f"{'T1 免修' if step == 0 else f'T2 第{step}步收敛'}"
                         f"({crit} {cxy:.1f}/{cz:.1f}mm"
+                        + (f",Δθ画面 {dyaw_cam:+.1f}°"
+                           if dyaw_cam is not None else "")
                         + ("" if step == 0 else
                            f",基座Δ {dxy:.1f}/{dz:.1f}mm 属预期(码静止)")
                         + ")")
@@ -947,36 +1173,111 @@ class ArmLoop:
                     f" —— {hint}")
             if step >= int(gate["iterations"]):
                 break
-            self.say(f"闸门[{where}]: T2 修正 {np.round(corr, 4).tolist()}m")
-            self.runner.runlog.event(
-                "gate_fix", self.arm, which=which, step=step,
-                corr_mm=[round(float(v) * 1000, 2) for v in corr])
-            try:
-                self.move_delta(corr, f"align_fix{step}")
-            except RobotError as e:
-                msg = str(e)
-                if ("几乎一致" not in msg and "无需运动" not in msg
-                        and "near-zero trajectory" not in msg):
-                    raise
-                # 修正量低于运动学分辨率 —— IK 判定目标与当前位姿等价
-                # 拒绝出轨迹;降级轴平移后厂商接口同样拒(单次平移须
-                # 引起 ≥0.5° 关节变化,2026-10-23 13:39 观察位姿下
-                # 2.3mm 修正仅 0.385° 被拒即此)—— 重测/重试也一样,
-                # 按收敛放行。
-                # 常见于 Δ 刚蹭过容差边缘(如 2.5mm vs 容差 2.0mm,
-                # 换算关节仅 ~0.4°):测量噪声±1mm 的量级,不值得停线。
-                # 只留量级:IK"最大关节变化 X°" / 厂商"max_delta_deg=X"
-                why = (msg.split("near-zero trajectory:")[-1].strip()
-                       if "near-zero trajectory" in msg
-                       else msg.split("(")[-1].split(")")[0])
+            # 旋转上限: 画面角超 max_corr_deg。分型与平移同思路 ——
+            # 基座系码角没动 = 码没转,是到位姿态与录参考时不一致
+            # (观察位重示教过/到位残差大),重录参考即愈;基座系也转了
+            # = 码/工装真被转了,人工确认
+            if dyaw_cam is not None and abs(dyaw_cam) > max_dyaw:
+                self.runner.runlog.event(
+                    "gate_fail", self.arm, which=which, step=step,
+                    reason="yaw_over_limit",
+                    dyaw_cam_deg=round(dyaw_cam, 2),
+                    dyaw_base_deg=(round(dyaw_base, 2)
+                                   if dyaw_base is not None else None),
+                    limit_deg=max_dyaw,
+                    duration_s=round(time.monotonic() - m0, 3))
+                hint = (f"码没转(θ基座 {dyaw_base:+.1f}°)但画面角"
+                        f"{dyaw_cam:+.1f}° → 到位姿态与录参考时不一致,"
+                        "在观察位重录参考即可"
+                        if dyaw_base is not None
+                        and abs(dyaw_base) <= tol_yaw
+                        else "码/工装真被转了或到位姿态大变,"
+                             "人工确认后重记参考")
+                raise ValueError(
+                    f"闸门[{where}] 拒绝旋转修正: 画面角 {dyaw_cam:+.1f}°"
+                    f" > 上限 {max_dyaw:.0f}° —— {hint}")
+            need_tr = not (cxy <= gate["tol_xy_mm"]
+                           and cz <= gate["tol_z_mm"])
+            need_rot = dyaw_cam is not None and abs(dyaw_cam) > tol_yaw
+            # 修正顺序: 先旋转后平移。相机装在离工具轴 ~83mm 的偏置位
+            # (armright 实测),自转 6° 相机横向摆 ~8.7mm —— 若先修平移,
+            # 视差里混着这个轨道位移,平移会追着它走偏再被旋转翻回来;
+            # 先自转把相机转回参考位姿,复测的视差才是纯平移误差。
+            lowres_rot = False
+            if need_rot:
+                # 纯工具自转修正: 画面角差 = 码绕相机光轴的转角,光轴≈
+                # 工具Z(实机 1.5°,az=0.9997),末端绕工具Z 自转
+                # φ=Δθ/az 恰好抵消。只动这一个自由度 —— 不绕基座 Z
+                # (工具轴水平,绕基座 Z 会把进给方向甩出去,11-18 实测
+                # "修正不对"的根因),不动位置(法兰中心在工具轴上)。
+                # 旋转不走轴平移兜底(那是纯平移通道),IK 拒绝原样上抛
+                roll = dyaw_cam / az
+                cur = self.end_pose()
+                q_new = _roll_tool_quat(cur["orientation"], roll)
+                self.say(f"闸门[{where}]: T2 旋转修正 工具自转"
+                         f" {roll:+.1f}°(画面角 {dyaw_cam:+.1f}°,"
+                         f"位置不动)")
+                self.runner.runlog.event(
+                    "gate_fix_rot", self.arm, which=which, step=step,
+                    dyaw_deg=round(dyaw_cam, 2),
+                    roll_deg=round(roll, 2),
+                    axis="tool_z", pos_moved=False,
+                    az=round(az, 4))
+                try:
+                    self.move_target([float(v) for v in cur["position"]],
+                                     quat_to_rpy_deg(q_new),
+                                     f"align_fixrot{step}")
+                except RobotError as e:
+                    msg = str(e)
+                    if ("几乎一致" not in msg and "无需运动" not in msg
+                            and "near-zero trajectory" not in msg):
+                        raise
+                    lowres_rot = True     # 角差换算关节 < 分辨率,同 low_res
+                if not lowres_rot:
+                    continue        # 自转完成 → 复测后再修平移
+            lowres_tr: str | None = None
+            if need_tr:
+                self.say(f"闸门[{where}]: T2 修正 "
+                         f"{np.round(corr, 4).tolist()}m")
+                self.runner.runlog.event(
+                    "gate_fix", self.arm, which=which, step=step,
+                    corr_mm=[round(float(v) * 1000, 2) for v in corr])
+                try:
+                    self.move_delta(corr, f"align_fix{step}")
+                except RobotError as e:
+                    msg = str(e)
+                    if ("几乎一致" not in msg and "无需运动" not in msg
+                            and "near-zero trajectory" not in msg):
+                        raise
+                    # 修正量低于运动学分辨率 —— IK 判定目标与当前位姿
+                    # 等价拒绝出轨迹;降级轴平移后厂商接口同样拒(单次
+                    # 平移须引起 ≥0.5° 关节变化,2026-10-23 13:39
+                    # 观察位姿下 2.3mm 修正仅 0.385° 被拒即此)。
+                    # 还有旋转待修时不能就此放行 —— 记下来,旋转修完
+                    # 再一起判。
+                    lowres_tr = (msg.split("near-zero trajectory:")[-1]
+                                 .strip() if "near-zero trajectory" in msg
+                                 else msg.split("(")[-1].split(")")[0])
+            if (lowres_tr is not None or lowres_rot) \
+                    and (not need_tr or lowres_tr is not None) \
+                    and (not need_rot or lowres_rot):
+                # 所有待修项都撞运动分辨率 floor 才放行;有一项正常
+                # 执行了就继续循环复测(老逻辑:重测也一样,放行)
+                parts = []
+                if lowres_tr is not None:
+                    parts.append(f"平移({lowres_tr})")
+                if lowres_rot:
+                    parts.append(f"旋转{dyaw_cam:+.1f}°")
                 return _pass(
                     "T2",
-                    f"闸门[{where}]: ✓ 修正量低于运动分辨率({why})"
+                    f"闸门[{where}]: ✓ 修正量低于运动分辨率("
+                    f"+".join(parts) + ")"
                     f" —— 按收敛放行(Δ {dxy:.1f}/{dz:.1f}mm ≈ 容差边缘)",
                     low_res=True)
         if (dxy <= gate["tol_xy_mm"] and dz <= gate["tol_z_mm"]
                 and cxy <= 1.5 * gate["tol_xy_mm"]
-                and cz <= 1.5 * gate["tol_z_mm"]):
+                and cz <= 1.5 * gate["tol_z_mm"]
+                and (dyaw_cam is None or abs(dyaw_cam) <= 1.5 * tol_yaw)):
             # 迭代用尽但基座Δ达标(码静止时与臂位姿无关的判据,抓取
             # 真正用的坐标)且视差未失控(<1.5×容差,只容噪声压线)→
             # 按噪声边缘放行,不停线。2026-10-23 14:37 中间件: 步0
@@ -990,6 +1291,10 @@ class ArmLoop:
         self.runner.runlog.event(
             "gate_fail", self.arm, which=which, reason="not_converged",
             crit=crit, cxy_mm=round(cxy, 1), cz_mm=round(cz, 1),
+            dyaw_cam_deg=(round(dyaw_cam, 2) if dyaw_cam is not None
+                          else None),
+            dyaw_base_deg=(round(dyaw_base, 2) if dyaw_base is not None
+                           else None),
             dxy_mm=round(dxy, 1), dz_mm=round(dz, 1),
             duration_s=round(time.monotonic() - m0, 3))
         # 保险: 失败时把两个判据都摆出来,并区分"参考观感过期"与
@@ -998,9 +1303,19 @@ class ArmLoop:
                 "一致(链路变动/老参考),重录参考即可"
                 if dxy <= gate["tol_xy_mm"] and dz <= gate["tol_z_mm"]
                 else "基座Δ也超差 → 疑似码/工装被挪,人工确认后重录参考")
+        if dyaw_cam is not None and abs(dyaw_cam) > tol_yaw:
+            hint += (f";画面角 {dyaw_cam:+.1f}° 未收敛"
+                     + (f"(基座系 {dyaw_base:+.1f}° = 码真被转了,"
+                        "重录参考)"
+                        if dyaw_base is not None
+                        and abs(dyaw_base) > tol_yaw
+                        else "(基座系码角正常 = 到位姿态差,"
+                        "重录参考/查回放残差)"))
         raise ValueError(f"闸门[{where}] {gate['iterations']} 步修正后仍超差"
-                         f"({crit} {cxy:.1f}/{cz:.1f}mm,基座Δ "
-                         f"{dxy:.1f}/{dz:.1f}mm) —— 停线。{hint}")
+                         f"({crit} {cxy:.1f}/{cz:.1f}mm"
+                         + (f",画面角 {dyaw_cam:+.1f}°"
+                            if dyaw_cam is not None else "")
+                         + f",基座Δ {dxy:.1f}/{dz:.1f}mm) —— 停线。{hint}")
 
     # ------------------------------------------------------------ 左臂: 视觉吸取
     def scan_and_pick(self, from_current: bool = False):
@@ -1222,67 +1537,111 @@ class ArmLoop:
         _startup_meas_d),没有才退回 Δ锚;每个重解结果再用 FK 复核
         (平移后末端位移 vs Δ,残差>0.5mm=IK 解走了别的分支,停线)。
         重解失败(不可达/跳解)= 该点位偏移后到不了,立即停线: 此时臂
-        还在观察位,安全;提示减小挪动量或重示教该动作。"""
+        还在观察位,安全;提示减小挪动量或重示教该动作。
+
+        旋转传播(2026-11-18,当日二修=实测旋转矩阵): 闸门同次测量锁存
+        码姿态的完整变化 ΔR = R_now @ R_ref⁻¹(任意轴,不假设基座 Z ——
+        本机观察位工具Z≈基座+Y,码面绕自身法向转=绕基座Y/Ry 转,旧版
+        绕基座 Rz 跟转,轴差 90°,实测"应用的旋转轴不对";且竖直面码的
+        基座 yaw 投影病态,旧读数可假到几十度)。ΔR 角度 > rot_min_deg
+        才传播,路点更新为"绕参考码位置按 ΔR 刚体转 + Δ 平移"(对一般
+        刚体运动是精确分解),姿态跟着转(夹爪对齐转过的工件),日志带
+        转轴便于核对。到位姿态差不进传播(下游回放示教关节,姿态本来
+        就对)。FK 复核同步刚体化。老参考没存 R_marker_base → 仅平移,
+        行为与纯平移版逐位一致。"""
         off = (self._startup_meas_d if self._startup_meas_d is not None
                else self._gate_offset)
         self._gate_offset = None
         self._startup_delta = np.zeros(3)
         self._shifted_wps = {}
+        dR = self._startup_meas_dR
+        dtheta = self._startup_meas_dtheta      # 仅消息/日志用(ΔR 的角度)
+        daxis = self._startup_meas_daxis
+        marker_pos = self._startup_meas_marker
+        rot_min = float(self.runner.cfg["gate"].get("rot_min_deg", 0.5))
+        if dR is not None and abs(dtheta) < rot_min:
+            dR = dtheta = None                  # 角度死区,不值得重解姿态
+        if dR is not None and marker_pos is None:
+            self.say(f"启动PBVS: ⚠ 测到码转 {dtheta:+.1f}° 但缺码位置,"
+                     "旋转不传播(仅平移)—— 重录参考可修")
+            dR = dtheta = None
         if off is None:
             self.say("启动PBVS: 闸门通过但无 Δ(未取到测量值),"
                      "后续按原示教回放")
             return
         mm = float(np.linalg.norm(off)) * 1000.0
-        if mm < float(self._mv_cfg()["reanchor_min_mm"]):
+        if mm < float(self._mv_cfg()["reanchor_min_mm"]) \
+                and dR is None:
             self.say(f"启动PBVS: Δ {mm:.2f}mm < "
                      f"{self._mv_cfg()['reanchor_min_mm']}mm 死区,"
                      "后续按原示教回放")
             return
+        if mm < float(self._mv_cfg()["reanchor_min_mm"]):
+            off = np.zeros(3)                   # 平移死区但码转了:只传旋转
         acts = self.runner.cfg["arms"][self.arm]["actions"]
         shifted, report, max_fk = {}, [], 0.0
-        for name in flow_store.ACTIONS_META[self.arm]:
-            wps = acts[name]["waypoints"]
-            if not wps:
-                continue
+
+        def _shift_list(name: str, bin: str, wps: list) -> list:
+            """一套路点(某动作某仓)整体 刚体变换(Δ平移[+绕码按ΔR转]) 重解 IK。"""
             new = []
             for i, w in enumerate(wps):
                 ep = w.get("end_pose") or {}
                 if not ep.get("position") or not ep.get("orientation"):
                     raise ValueError(
-                        f"启动PBVS: {name} 点{i + 1} 缺 end_pose ——"
+                        f"启动PBVS: {name}{'右仓' if bin == 'R' else ''}"
+                        f" 点{i + 1} 缺 end_pose ——"
                         " 重新示教一遍该动作即可补全")
-                tgt = [float(ep["position"][k]) + float(off[k])
-                       for k in range(3)]
+                p_t = np.asarray(ep["position"], float)
+                q_t = [float(v) for v in ep["orientation"]]
+                if dR is None:
+                    tgt = p_t + np.asarray(off, float)
+                    rpy_t = quat_to_rpy_deg(q_t)
+                else:
+                    # 绕参考码位置按实测 ΔR(任意轴)刚体转再叠加平移。
+                    # 注意与闸门 T2 的工具自转是两回事 —— 这里是码/工装
+                    # 整体真转了,夹爪必须整姿态随刚体转;T2 修的是臂
+                    # 到位姿态差,那只该动工具自转一个自由度。
+                    p2, q2 = _rigid_pose(p_t, q_t, marker_pos, dR)
+                    tgt = p2 + np.asarray(off, float)
+                    rpy_t = quat_to_rpy_deg(q2)
                 try:
                     out = plan_cartesian_path(
                         self.arm, [float(v) for v in w["joints_deg"]],
-                        op="target", target_pos_m=tgt,
-                        target_rpy_deg=quat_to_rpy_deg(
-                            [float(v) for v in ep["orientation"]]),
+                        op="target", target_pos_m=[float(v) for v in tgt],
+                        target_rpy_deg=rpy_t,
                         cur_pos_m=[float(v) for v in ep["position"]],
-                        cur_quat=[float(v) for v in ep["orientation"]])
+                        cur_quat=q_t)
                     sol = (out.get("waypoints_deg") or [None])[-1]
                     if sol is None:
                         raise RobotError("逆解未返回轨迹")
-                    # FK 复核: 平移后关节的末端位移应恰为 Δ(URDF 系。
-                    # 上报系与 URDF 系只差固定纯平移安装偏移,平移量在
-                    # 两系相等)。残差大 = IK 落到了别的分支/姿态变了,
-                    # 照走会偏 —— 直接停线
+                    # FK 复核: 重解后关节的末端应恰落在"刚体变换后的
+                    # 示教位姿"(URDF 系。上报系与 URDF 系只差固定纯
+                    # 平移安装偏移,平移/旋转量在两系相等)。残差大 =
+                    # IK 落到了别的分支,照走会偏 —— 直接停线
                     fk0 = plan_cartesian_path(
                         self.arm, [float(v) for v in w["joints_deg"]],
                         op="fk")
                     fk1 = plan_cartesian_path(
                         self.arm, [float(v) for v in sol], op="fk")
-                    rd = (np.array(fk1["pos_m"], float)
-                          - np.array(fk0["pos_m"], float))
-                    resid_mm = float(
-                        np.linalg.norm(rd - np.asarray(off, float))) * 1000.0
+                    if dR is None:
+                        expected = np.array(fk0["pos_m"], float) \
+                            + np.asarray(off, float)
+                    else:
+                        expected = _rigid_pose(
+                            fk0["pos_m"], [0.0, 0.0, 0.0, 1.0],
+                            marker_pos, dR)[0] + np.asarray(off, float)
+                    rd = np.array(fk1["pos_m"], float)
+                    resid_mm = float(np.linalg.norm(rd - expected)) * 1000.0
                     if resid_mm > 0.5:
                         dmm = np.round(np.asarray(off, float) * 1000.0, 1)
                         raise ValueError(
-                            f"启动PBVS: {name} 点{i + 1} 重解后 FK 复核残差 "
-                            f"{resid_mm:.2f}mm(≠Δ {dmm.tolist()}mm) —— "
+                            f"启动PBVS: {name}{'右仓' if bin == 'R' else ''}"
+                            f" 点{i + 1} 重解后 FK 复核残差 "
+                            f"{resid_mm:.2f}mm(≠Δ {dmm.tolist()}mm"
+                            + (f"+转{dtheta:.1f}°" if dR is not None
+                               else "") + ") —— "
                             "IK 走了不同分支,减小挪动量或重示教该动作")
+                    nonlocal max_fk
                     max_fk = max(max_fk, resid_mm)
                 except RobotError as e:
                     msg = str(e)
@@ -1291,31 +1650,56 @@ class ArmLoop:
                         new.append(dict(w))   # 低于运动分辨率: 关节不变
                         continue
                     raise ValueError(
-                        f"启动PBVS: {name} 点{i + 1} 平移 "
-                        f"{np.round(off * 1000.0, 1).tolist()}mm 后重解失败"
+                        f"启动PBVS: {name}{'右仓' if bin == 'R' else ''}"
+                        f" 点{i + 1} 平移 "
+                        f"{np.round(off * 1000.0, 1).tolist()}mm"
+                        + (f"+转{dtheta:.1f}°" if dR is not None
+                           else "") + " 后重解失败"
                         f"({msg}) —— 该点位偏移后不可达或跳解,"
                         "减小挪动量或重示教该动作") from e
                 nw = dict(w)
                 nw["joints_deg"] = [float(v) for v in sol]
-                nw["end_pose"] = {"position": tgt,
-                                  "orientation": list(ep["orientation"])}
+                nw["end_pose"] = {"position": [float(v) for v in tgt],
+                                  "orientation": (q2 if dR is not None
+                                                  else list(ep["orientation"]))}
                 new.append(nw)
-            shifted[name] = new
-            dj = max(max(abs(a - b) for a, b in zip(n["joints_deg"],
-                                                    o["joints_deg"]))
-                     for n, o in zip(new, wps))
-            report.append((name, dj))
+            return new
+
+        for name in flow_store.ACTIONS_META[self.arm]:
+            # 双仓动作左右两套路线各自平移重解(键=(动作,仓));
+            # 右仓尾段为空 → effective 即左仓路线本身,不再重复一份
+            variants: list[tuple[str, list]] = []
+            if acts[name]["waypoints"]:
+                variants.append(("L", acts[name]["waypoints"]))
+            if (self._bins_on() and name in flow_store.BIN_ACTIONS):
+                rwps = flow_store.effective_waypoints(acts[name], "R")
+                if rwps and rwps is not acts[name]["waypoints"]:
+                    variants.append(("R", rwps))
+            for bin, wps in variants:
+                new = _shift_list(name, bin, wps)
+                shifted[(name, bin)] = new
+                dj = max(max(abs(a - b) for a, b in zip(n["joints_deg"],
+                                                        o["joints_deg"]))
+                         for n, o in zip(new, wps))
+                report.append((f"{name}{'[右仓]' if bin == 'R' else ''}", dj))
         self._startup_delta = np.asarray(off, float)
         self._shifted_wps = shifted
         src = "实测码位移" if self._startup_meas_d is not None else "Δ锚"
+        # 转轴明示: 本机几何 ≈基座Y(工具Z/码法向沿+Y),一眼核对应用的轴
+        rot_txt = (f"+转{dtheta:.1f}°绕轴{np.round(daxis, 2).tolist()}"
+                   f"(过参考码 {np.round(marker_pos, 3).tolist()}m)"
+                   if dR is not None else "")
         self.say(f"启动PBVS: ✓ 定标 Δ={np.round(off * 1000.0, 1).tolist()}mm"
-                 f"({src}),{len(shifted)} 个动作路点已平移"
+                 f"{rot_txt}({src}),{len(shifted)} 个动作路点已重解"
                  f"(FK 复核最大残差 {max_fk:.2f}mm;各动作关节最大变化 "
                  + ", ".join(f"{n} {d:.1f}°" for n, d in report)
                  + "),本轮及后续轮次不再闸门")
         self.runner.runlog.event(
             "startup_fix", self.arm,
             delta_mm=[round(float(v) * 1000.0, 2) for v in off],
+            delta_rot_deg=(round(dtheta, 2) if dR is not None else None),
+            delta_rot_axis=(np.round(daxis, 3).tolist()
+                            if dR is not None else None),
             delta_src=src, fk_resid_mm=round(max_fk, 3),
             actions={n: round(float(d), 2) for n, d in report})
 
@@ -1339,7 +1723,7 @@ class ArmLoop:
                                      else "startup_nocal")
             return
         if self.runner.cfg["arms"][self.arm]["actions"][obs_action]["waypoints"]:
-            res = self.align_gate(which)
+            res = self.align_gate(which, where=where)
             if (self.runner.cfg["gate"].get("mode") == "startup"
                     and res.get("tier") in ("T1", "T2")):
                 self._latch_startup_delta()
@@ -1348,8 +1732,56 @@ class ArmLoop:
             self.runner.runlog.event("gate_skip", self.arm, which=which,
                                      reason=f"{obs_action}_empty")
 
+    def _has_obs_pose(self, which: str = "align") -> bool:
+        """该站是否记录了独立观察位(槽位 obs_pose)。"""
+        slot = self.runner.cfg["arms"][self.arm].get(which) or {}
+        return bool((slot.get("obs_pose") or {}).get("joints_deg"))
+
+    def _goto_obs_pose(self, which: str, where: str,
+                       obs: dict | None = None) -> None:
+        """启动PBVS 独立观察位(2026-11-18,右臂流水线3 默认=B5点1
+        初始位): 关节回放到记录的观察位,给闸门测量用。移动与
+        goto_align_ref 同款: 段后验证 + 补走一次(从当前位重发)。"""
+        if obs is None:
+            obs = (self.runner.cfg["arms"][self.arm].get(which)
+                   or {}).get("obs_pose") or {}
+        target = [float(v) for v in obs.get("joints_deg") or []]
+        if not target:
+            raise ValueError(f"启动PBVS[{where}]: 观察位未记录关节")
+        mv = self._mv_cfg()
+        speed = speed_store.get_speed(self.arm)
+        tol = float(mv["joint_tol_deg"])
+        self.set_phase("pbvs_goto_obs")
+        self.say(f"启动PBVS[{where}]: 回观察位"
+                 f"({obs.get('note') or '记录位'},速度 {speed}%)"
+                 " —— 到位即测,请勿按停止")
+        t0 = time.time()
+        for attempt in range(2):
+            send = [target]
+            if attempt:      # 补走从当前位重发,避免相同目标被当重复吞掉
+                cur0 = self.robot.get_joint_angles().get(self.arm) or []
+                if len(cur0) == len(target):
+                    send = [cur0, target]
+            self.robot.move_robotarm_traj(self.arm, send, 1,
+                                          mv["move_timeout_s"], speed)
+            time.sleep(0.3)                       # 收敛中,稍等复读
+            cur = self.robot.get_joint_angles().get(self.arm) or []
+            if len(cur) == len(target) and \
+                    max(abs(a - b) for a, b in zip(cur, target)) <= tol:
+                break
+            if attempt:
+                raise RobotError(f"启动PBVS[{where}]: 回观察位到位验证失败"
+                                 f"(关节差 > {tol}°,补走后仍超差)"
+                                 " —— 臂停在当前位,请人工检查")
+        self.runner.runlog.event(
+            "move", self.arm, name="pbvs_obs", move_kind="obs",
+            speed_pct=speed, ok=True,
+            dur_s=round(time.time() - t0, 2))
+
     def _startup_pbvs(self, obs_action: str, which: str, where: str):
-        """启动PBVS(流水线3 右臂专用入口): 调用方须已把臂停在观察位
+        """启动PBVS(流水线3 右臂专用入口)。
+        槽位记了独立观察位(obs_pose,右臂默认=B5点1 初始位): 自己回
+        观察位再测,调用方无需先就位;没记则调用方须已把臂停在观察位
         (右臂=就位 B2 点1 后、等 FILLED 之前 —— 裁剪还在切,测量零等待)。
         仅 gate.mode=startup 且尚未定标时测一次并定标到全臂;verify/off
         模式静默不测(裁剪方案原本就没有过程右臂闸门,维持原行为)。
@@ -1372,6 +1804,14 @@ class ArmLoop:
             self._shifted_wps = {}
             self.runner.runlog.event("gate_skip", self.arm, which=which,
                                      reason="startup_noref")
+            return
+        obs = slot.get("obs_pose") or {}
+        if obs.get("joints_deg"):
+            # 独立观察位: 回观察位 → 测 → 收敛即定标;不依赖任何动作路点
+            self._goto_obs_pose(which, where, obs)
+            res = self.align_gate(which, where=where)
+            if res.get("tier") in ("T1", "T2"):
+                self._latch_startup_delta()
             return
         self._gate_or_skip(obs_action, which, where)
 
@@ -1488,6 +1928,11 @@ class ArmLoop:
                 self._cut_step("lift_home", t0)
                 home_done = True
             a2_simple = len(a2act["waypoints"]) <= 2   # 点2=释放位(现场确认)
+            # 本轮已断真空放料计数(推②前须=2): 2 点示教数显式断真空,
+            # ≥3 点示教数 [2:] 段的真空释放 —— 无真空配置则恒为 0,
+            # 推②前必拦(顺带保护示教配错: 该放没放就停线,不推空料仓)
+            a2_vac_rel = (a2act.get("vacuum") or {}).get("event") == "release"
+            released = 0
             # ── 轮首就发升降线程: [等上轮推②完成→]右臂清空(EMPTY)→降到
             # 中间点 —— 与吸第1摞完全并行。11-12 复盘: 首轮曾把这一步排在
             # "放完第1摞"之后,臂都到 A2 点2 了升降还在最高点才开始降;
@@ -1529,6 +1974,7 @@ class ArmLoop:
             if a2_simple:
                 self.say("A2 点2 到位,断真空放第1摞")
                 self.runner.vacuum(self, "release")
+                released += 1
             # ── 放好①摞 → 发推①线程: 等升降到中间(通常早已到)即推 ──
             pbox, armed = {}, threading.Event()
 
@@ -1546,6 +1992,8 @@ class ArmLoop:
                     armed.set()
             self._spawn(_push1, f"cutter-push1-{self.cycles + 1}")
             self.play_action("A2_place", reanchor=True, wp_range=(2, None))
+            if not a2_simple and a2_vac_rel:
+                released += 1            # [2:] 段内真空已释放(下降点)
             # ── 第 2 摞: 吸取(与升降/推①并行)→ A2 点2 等推杆回位 → 放 ──
             self.play_action("A1_transfer")
             self.scan_and_pick(from_current=True)
@@ -1566,8 +2014,16 @@ class ArmLoop:
             if a2_simple:
                 self.say("A2 点2 到位,断真空放第2摞")
                 self.runner.vacuum(self, "release")
+                released += 1
             self.play_action("A2_place", reanchor=True, wp_range=(2, None))
+            if not a2_simple and a2_vac_rel:
+                released += 1            # [2:] 段内真空已释放(下降点)
             # ── 推②(联动升)异步: 完成线程置 FILLED,左臂不等立刻下一轮 ──
+            if released < 2:     # 料仓校验: 两摞没放齐就推=推空仓再升起
+                self.say(f"料仓校验失败: 本轮仅释放 {released}/2 摞,停线")
+                raise ValueError(
+                    f"料仓未满2摞(已释放{released}),禁止推② —— "
+                    "检查真空释放配置/吸盘")
             cyc = self.cycles + 1            # 轮号在受理时定格(fin2 异步收口)
             t2 = time.time()
             try:
@@ -1641,15 +2097,30 @@ class ArmLoop:
                 # 裁剪在切的这段空闲正好用来测码+重解全程路点,零节拍代价
                 if self.runner.cutter is not None and self.runner.cfg[
                         "arms"][self.arm]["actions"]["B2_pick"]["waypoints"]:
-                    self.play_action("B2_pick", wp_range=(0, 1))
-                    self.say("右臂: 已就位 B2 点1,先启动PBVS定标"
-                             "再等裁剪完成(FILLED)")
-                    self._startup_pbvs("B2_pick", "align", "裁剪取料位")
+                    if self._has_obs_pose():
+                        # 观察位=独立记录点(如 B5点1 初始位): 先回去测
+                        # PBVS(与裁剪并行,提示语见 _goto_obs_pose),
+                        # 测完再就位 B2 点1 等 FILLED
+                        self._startup_pbvs("B2_pick", "align", "裁剪取料位")
+                        self.play_action("B2_pick", wp_range=(0, 1))
+                        self.say("右臂: 已就位 B2 点1,等裁剪完成(FILLED)")
+                    else:
+                        self.say("右臂: 先去 B2 点1(PBVS 观察位)—— "
+                                 "到位先测 PBVS 定标,再等裁剪完成(FILLED)"
+                                 "(慢速就位约十秒,请勿按停止)")
+                        self.play_action("B2_pick", wp_range=(0, 1))
+                        self._startup_pbvs("B2_pick", "align", "裁剪取料位")
                 self.runner.handoff.wait_fixture("FILLED", self)
             elif self.runner.cutter is not None and self.runner.cfg[
                     "arms"][self.arm]["actions"]["B2_pick"]["waypoints"]:
-                # 单臂右测(裁剪): 同样先就位 B2 点1 做启动PBVS定标
-                self.play_action("B2_pick", wp_range=(0, 1))
+                # 单臂右测(裁剪): 有独立观察位(如 B5点1)先回去做启动
+                # PBVS 定标拿 Δ(移动/提示见 _goto_obs_pose),之后的
+                # 夹取/转移/放仓全部带修正;没记观察位则就位 B2 点1 兼作
+                if not self._has_obs_pose():
+                    self.say("右臂测试: 先去 B2 点1(PBVS 观察位)—— "
+                             "到位先测 PBVS 定标拿到 Δ,之后的夹取/转移/"
+                             "放仓全部带修正(慢速就位约十秒,请勿按停止)")
+                    self.play_action("B2_pick", wp_range=(0, 1))
                 self._startup_pbvs("B2_pick", "align", "裁剪取料位")
             wp_center = self._has_center_marks(
                 ("B1_approach", "B2_pick"))
@@ -1698,8 +2169,9 @@ class ArmLoop:
             if self.runner.cfg["arms"][self.arm]["actions"]["B5_extra"]["waypoints"]:
                 self.play_action("B5_extra")
                 self.post_grip("B5_extra")
+            cyc_bin = self._cur_bin()          # 本轮投放仓(cycles++ 前取)
             self.cycles += 1
-            self._mark_cycle()
+            self._mark_cycle(bin=cyc_bin)
             if self.single_shot:
                 if self.cycles >= (self.max_cycles or 1):
                     self.say(f"◎ 单臂测试: {self.cycles} 个循环完成,自动停止"
@@ -1710,7 +2182,7 @@ class ArmLoop:
                          f"(第 {self.cycles} 件已送完料仓)")
                 return
 
-    def _mark_cycle(self):
+    def _mark_cycle(self, bin: str | None = None):
         if self.phase and self.phase != "cycle_gap":
             self.set_phase("cycle_gap")    # 收口末个动作,间隙计入下一轮
         dt = time.time() - self._cycle_t0
@@ -1741,6 +2213,7 @@ class ArmLoop:
                "wait_s": round(wait_s, 1),
                "work_s": round(work_s, 1),
                "picks": sum(1 for p, _ in self._cycle_phases if p == "scan"),
+               "bin": (bin if self._bins_on() else None),   # 本轮投放仓
                "avg_recent_s": round(float(np.mean(self.cycle_ts)), 3),
                "speed_pct": speed_store.get_speed(self.arm),
                "speeds_used": used,
@@ -1748,6 +2221,7 @@ class ArmLoop:
                "actions": self._cycle_actions,
                "gates": self._cycle_gates}
         self.say(f"◎ 循环 #{self.cycles} 完成 {dt:.1f}s"
+                 f"{('→➡右仓' if bin == 'R' else '→⬅左仓') if self._bins_on() else ''}"
                  f"(近均值 {np.mean(self.cycle_ts):.1f}s,"
                  f"speed {spd_txt})")
         self.runner.runlog.event("cycle", self.arm, **rec)
@@ -2218,6 +2692,9 @@ def record_align_ref(robot: TianlianRobot, cameras: FlowCameras,
     q = robot.get_joint_angles().get(arm) or []
     ref = {"p_base": m["p_base"], "key": m["key"], "z_cam_mm": m["z_cam_mm"],
            "p_cam": m["p_cam"],           # 相机系原始观感(PBVS 基准)
+           "yaw_cam_deg": m.get("yaw_cam_deg"),    # 画面角基准(旋转修正)
+           "yaw_base_deg": m.get("yaw_base_deg"),  # 基座系码角(信息展示)
+           "R_marker_base": m.get("R_marker_base"),  # 码姿态矩阵(刚体传播)
            "spread_mm": m.get("spread_mm"),
            "marker": slot["marker"], "marker_size_mm": slot["marker_size_mm"],
            "cam_role": role, "joints_deg": [round(float(v), 3) for v in q],
@@ -2254,14 +2731,41 @@ def test_align_gate(robot: TianlianRobot, cameras: FlowCameras,
                             frames=int(cfg["gate"]["frames"]))
     d = (np.array(m["p_base"]) - np.array(ref["p_base"])) * 1000.0
     g = cfg["gate"]
+    dyaw_cam = dyaw_base = None
+    if ref.get("yaw_cam_deg") is not None \
+            and m.get("yaw_cam_deg") is not None:
+        dyaw_cam = round(_wrap180(m["yaw_cam_deg"] - ref["yaw_cam_deg"]), 2)
+        dyaw_base = round(_wrap180(m["yaw_base_deg"] - ref["yaw_base_deg"]),
+                          2) if ref.get("yaw_base_deg") is not None \
+            and m.get("yaw_base_deg") is not None else None
+    tol_yaw = float(g.get("tol_yaw_deg", 1.0))
+    yaw_ok = dyaw_cam is None or abs(dyaw_cam) <= tol_yaw
+    # ΔR 预览: 传播会跟转多少/绕什么轴(参考未存 R 矩阵时 None)
+    drot_deg = drot_axis = None
+    if m.get("R_marker_base") is not None and ref.get("R_marker_base"):
+        dR = np.array(m["R_marker_base"], float) \
+            @ np.array(ref["R_marker_base"], float).T
+        drot_deg, drot_axis = _rot_angle_axis(dR)
+        drot_deg = round(drot_deg, 2)
+        drot_axis = np.round(drot_axis, 2).tolist()
     verdict = ("PASS(T1 免修)" if np.hypot(d[0], d[1]) <= g["tol_xy_mm"]
-               and abs(d[2]) <= g["tol_z_mm"] else
+               and abs(d[2]) <= g["tol_z_mm"] and yaw_ok else
                "NEED-FIX(会触发 T2 修正)" if max(abs(d[0]), abs(d[1]),
                                                   abs(d[2])) <=
-               g["max_corr_mm"] else "REFUSE(超修正上限,停线)")
+               g["max_corr_mm"] and (dyaw_cam is None
+                                     or abs(dyaw_cam)
+                                     <= float(g.get("max_corr_deg", 10.0)))
+               and (drot_deg is None
+                    or drot_deg <= float(g.get("max_corr_deg", 10.0)))
+               else "REFUSE(超修正上限,停线)")
+    if drot_deg is not None and drot_deg > float(g.get("rot_min_deg", 0.5)):
+        verdict += (f";码转{drot_deg:.1f}°绕{drot_axis}"
+                    "(startup 传播将按此轴跟转)")
     return {"ok": True, "arm": arm, "which": which,
             "measured_p_base": m["p_base"], "ref_p_base": ref["p_base"],
             "delta_mm": [round(float(v), 2) for v in d],
+            "dyaw_cam_deg": dyaw_cam, "dyaw_base_deg": dyaw_base,
+            "drot_deg": drot_deg, "drot_axis": drot_axis,
             "key": m["key"], "ref_key": ref.get("key"),
             "z_cam_mm": m["z_cam_mm"], "verdict": verdict,
             "spread_mm": m.get("spread_mm"),
@@ -2362,6 +2866,12 @@ def fix_align_gate(robot: TianlianRobot, runner: "FlowRunner",
     loop.cycles, loop._cycle_gates = 0, []
     loop._cycle_t0, loop._cycle_phases = None, []
     loop._gate_offset = loop._taught_end_pos = None
+    loop._startup_meas_d = None
+    loop._startup_meas_dtheta = None
+    loop._startup_meas_dR = None
+    loop._startup_meas_daxis = None
+    loop._startup_rot_warned = False
+    loop._startup_meas_marker = None
     loop.say = lambda m: loop.log.append(m)
     g = loop.align_gate(which)
     return {**out, "gate": g, "log": loop.log}

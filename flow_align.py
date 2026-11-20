@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import cv2
+import math
 import numpy as np
 
 try:
@@ -142,7 +143,11 @@ class MarkerFinder:
     # ------------------------------------------------------------- PnP
     @staticmethod
     def solve_center(corners, intr: dict, marker_size_m: float):
-        """IPPE_SQUARE PnP → 码中心相机系 3D(米)。intr 需 fx/fy/ppx/ppy。"""
+        """IPPE_SQUARE PnP → (码中心相机系 3D[米], 画面角[度], R_cam_marker)。
+
+        画面角 = 码绕相机光轴的转角(ZYX yaw),即"看起来正不正";
+        旋转修正(2026-11-18)用。只要位置的调用方取返回值 [0] 即可。
+        intr 需 fx/fy/ppx/ppy。"""
         if not intr or not marker_size_m or marker_size_m <= 0:
             return None
         K = np.array([[intr["fx"], 0, intr["ppx"]],
@@ -153,12 +158,16 @@ class MarkerFinder:
         obj = np.array([[-half, half, 0], [half, half, 0],
                         [half, -half, 0], [-half, -half, 0]],
                        dtype=np.float64)
-        ok, _, tvec = cv2.solvePnP(obj, np.asarray(corners, np.float64),
-                                   K, None, flags=cv2.SOLVEPNP_IPPE_SQUARE)
+        ok, rvec, tvec = cv2.solvePnP(obj, np.asarray(corners, np.float64),
+                                      K, None, flags=cv2.SOLVEPNP_IPPE_SQUARE)
         if not ok:
             return None
         pos = tvec.ravel().astype(np.float64)
-        return pos if 0.05 < pos[2] < 4.0 else None
+        if not 0.05 < pos[2] < 4.0:
+            return None
+        R, _ = cv2.Rodrigues(rvec)
+        yaw = math.degrees(math.atan2(R[1, 0], R[0, 0]))
+        return pos, yaw, R
 
 
 def measure_marker_base(session, finder: MarkerFinder, marker: dict,
@@ -184,19 +193,27 @@ def measure_marker_base(session, finder: MarkerFinder, marker: dict,
             if not found:
                 last_err = "画面中未找到指定码"
                 continue
-            p_cam = MarkerFinder.solve_center(found["corners"],
-                                              pair.get("intr"),
-                                              marker_size_m)
-            if p_cam is None:
+            sol = MarkerFinder.solve_center(found["corners"],
+                                            pair.get("intr"),
+                                            marker_size_m)
+            if sol is None:
                 last_err = "PnP 无解或 Z 异常(码尺寸/内参?)"
                 continue
+            p_cam, yaw_cam, R_cam_m = sol
             T = T_base_ee @ T_ee_cam
             p_base = (T @ np.array([p_cam[0], p_cam[1], p_cam[2], 1.0]))[:3]
-            pts.append((p_cam, p_base, found))
+            # 基座系码姿态: 与臂怎么到位无关,专测"码/工件本身转没转"。
+            # 注意 ZYX yaw 只是它的一个分解分量 —— 竖直面码的 yaw 投影
+            # 病态(方位角乱飘,2026-11-18 15:52 实测 -63° 假读数即此),
+            # 下游刚体传播必须用完整 R,不得只取 yaw
+            R_base_m = T[:3, :3] @ R_cam_m
+            yaw_base = math.degrees(math.atan2(R_base_m[1, 0], R_base_m[0, 0]))
+            pts.append(((p_cam, yaw_cam), (p_base, yaw_base),
+                        R_base_m, found))
         return pts, last_err
 
     def _spread(pts):
-        arr = np.array([p[0] for p in pts])
+        arr = np.array([p[0][0] for p in pts])
         return (np.max(arr, axis=0) - np.min(arr, axis=0)) * 1000.0
 
     # 保险一: 凑帧数 —— 解码帧 <3 时补采(最多两批)合并,凑不够也照常
@@ -225,11 +242,24 @@ def measure_marker_base(session, finder: MarkerFinder, marker: dict,
         elif pts2:
             pts += pts2                    # 不够 min_pts: 并入,中值更稳
             spread = _spread(pts)
-    pcs = np.median(np.array([p[0] for p in pts]), axis=0)
-    pbs = np.median(np.array([p[1] for p in pts]), axis=0)
-    found = pts[-1][2]
+    pcs = np.median(np.array([p[0][0] for p in pts]), axis=0)
+    pbs = np.median(np.array([p[1][0] for p in pts]), axis=0)
+    yaw_c = float(np.median([p[0][1] for p in pts]))
+    yaw_b = float(np.median([p[1][1] for p in pts]))
+    # 码姿态中值: 逐元素中值后 SVD 再正交化(帧间差 <1°,中值即稳)
+    R_med = np.median(np.array([p[2] for p in pts]), axis=0)
+    U, _, Vt = np.linalg.svd(R_med)
+    R_m = U @ Vt
+    if np.linalg.det(R_m) < 0:
+        U[:, -1] *= -1.0
+        R_m = U @ Vt
+    found = pts[-1][3]
     return {"p_base": [round(float(v), 5) for v in pbs],
             "p_cam": [round(float(v), 5) for v in pcs],
+            "yaw_cam_deg": round(yaw_c, 2),    # 画面角(相机系,旋转修正判据)
+            "yaw_base_deg": round(yaw_b, 2),   # 基座系码角(信息展示用)
+            "R_marker_base": [[round(float(v), 5) for v in row]
+                              for row in R_m],   # 完整码姿态(刚体传播用)
             "z_cam_mm": round(float(pcs[2]) * 1000.0, 1),
             "frames_used": len(pts), "key": found["key"],
             "spread_mm": [round(float(v), 1) for v in spread],

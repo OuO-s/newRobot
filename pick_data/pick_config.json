@@ -7,7 +7,7 @@
   "cruise_clearance_mm": 40.0,
   "press_mm": 5.0,
   "max_press_mm": 10.0,
-  "hold_s": 2.0,
+  "hold_s": 0.5,
   "ghost_min_z_mm": 200.0,
   "layer_mm": 25.0,
   "max_horiz_m": 0.45,
@@ -15,7 +15,7 @@
   "xy_res_tol_mm": 8.0,
   "z_res_tol_mm": 5.0,
   "speed": 10,
-  "settle_s": 1.2,
+  "settle_s": 0.1,
   "move_timeout_s": 60.0,
   "vacuum": {
     "mode": "valve",
