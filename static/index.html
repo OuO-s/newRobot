@@ -702,8 +702,14 @@
         <div class="row" style="margin:2px 0 8px;flex-wrap:wrap;gap:8px;align-items:center;border:1px dashed #456;border-radius:6px;padding:6px 10px;">
           <b>📦 双仓投放</b>
           <label title="启用后 B3/B4/B5 示教区拆成『⬅左仓/➡右仓』两列分别示教,运行按轮次自动切仓:每 K 轮切一仓交替。停用=全部按左仓(原单仓行为)"><input type="checkbox" id="flBinsEn" /> 启用</label>
-          <label title="每仓连续投放的轮数 K:第 1~K 轮→左仓,第 K+1~2K 轮→右仓,如此往复。K=2 + 轮次填 4 = 前两轮左仓、后两轮右仓">每仓轮数 K
+          <label title="每仓连续投放的轮数 K(仓选择=自动交替时生效):第 1~K 轮→左仓,第 K+1~2K 轮→右仓,如此往复。K=2 + 轮次填 4 = 前两轮左仓、后两轮右仓">每仓轮数 K
             <input id="flBinsPer" type="number" min="1" max="99" step="1" value="2" size="2" /></label>
+          <label title="锁定只跑一个仓:示教完右仓先单独验证右仓、或只往一个仓上料时用;锁定的仓忽略每仓轮数,右臂测试同规则。示教列的▶试跑不受此锁定(仍可单测任一仓)">仓选择
+            <select id="flBinsOnly">
+              <option value="auto">自动交替</option>
+              <option value="L">只跑⬅左仓</option>
+              <option value="R">只跑➡右仓</option>
+            </select></label>
           <button id="flBinsSave" class="primary">💾保存</button>
           <span class="muted">B3 在共享段之后分仓(默认点3=料仓上方);B4/B5 整段分仓;
             右仓列空=该动作两仓走同一路线。改完对下次启动生效。</span>

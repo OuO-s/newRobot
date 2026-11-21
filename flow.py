@@ -452,15 +452,19 @@ class ArmLoop:
                           .get("bins") or {}).get("enabled")))
 
     def _cur_bin(self, name: str | None = None) -> str:
-        """本轮循环投放仓: 每 rounds_per 轮切一仓交替(L→R→L→…)。
+        """本轮循环投放仓: bins.only="L"/"R"=锁定只跑该仓(示教/验证
+        单仓用);否则每 rounds_per 轮切一仓交替(L→R→L→…)。
         cycles=已完成循环数(本轮开始时),第 1 轮 cycles=0 → 前进左仓。
         双仓停用/动作不支持 → 恒 "L"(原单仓行为)。"""
         if not self._bins_on():
             return "L"
         if name is not None and name not in flow_store.BIN_ACTIONS:
             return "L"
-        k = int((self.runner.cfg["arms"]["armright"].get("bins") or {})
-                .get("rounds_per", 2) or 2)
+        bcfg = self.runner.cfg["arms"]["armright"].get("bins") or {}
+        only = str(bcfg.get("only", "auto") or "auto")
+        if only in ("L", "R"):
+            return only
+        k = int(bcfg.get("rounds_per", 2) or 2)
         return "L" if (self.cycles // k) % 2 == 0 else "R"
 
     def _effective_wps(self, act: dict, bin: str) -> list:

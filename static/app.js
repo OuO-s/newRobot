@@ -2276,15 +2276,18 @@ function flBinsRender(cfg) {
   const b = (cfg && cfg.arms && cfg.arms.armright.bins) || {};
   const en = document.getElementById('flBinsEn');
   const per = document.getElementById('flBinsPer');
+  const only = document.getElementById('flBinsOnly');
   if (!en || !per) return;
   en.checked = !!b.enabled;
   per.value = b.rounds_per ?? 2;
+  if (only) only.value = b.only || 'auto';
 }
 document.getElementById('flBinsSave').addEventListener('click', async () => {
   try {
     await API.flConfigSet({ armright: { bins: {
       enabled: document.getElementById('flBinsEn').checked,
-      rounds_per: +document.getElementById('flBinsPer').value || 2 } } });
+      rounds_per: +document.getElementById('flBinsPer').value || 2,
+      only: (document.getElementById('flBinsOnly') || {}).value || 'auto' } } });
     toast('双仓投放配置已存(对下次启动生效)', 'success');
     flRefresh();
   } catch (e) { toast(e.message, 'error'); }

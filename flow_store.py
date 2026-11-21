@@ -148,9 +148,12 @@ DEFAULTS: dict = {
             # 运行时按轮次交替 —— 每 rounds_per 轮切一次仓:
             # 第 1~K 轮→左仓(waypoints),第 K+1~2K 轮→右仓(bins.tail),
             # 如此往复。K=2 + 轮次填 4 即"前两轮放左仓,后两轮放右仓"。
+            # only(11-21): "auto"=按 K 交替 / "L"|"R"=锁定只跑该仓
+            # (示教/验证单仓用,忽略 K)。
             "bins": {
                 "enabled": False,
                 "rounds_per": 2,    # 每仓连续投放轮数
+                "only": "auto",     # auto / L / R
             },
         },
     },
@@ -229,6 +232,7 @@ def _fill_actions(cfg: dict) -> dict:
             b = slot.setdefault("bins", {})
             b.setdefault("enabled", False)
             b.setdefault("rounds_per", 2)
+            b.setdefault("only", "auto")
         for name, meta in acts.items():
             a = actions.setdefault(name, {})
             a.setdefault("title", meta["title"])
@@ -563,6 +567,11 @@ def update_config(patch: dict) -> dict:
                 cur["enabled"] = bool(b["enabled"])
             if "rounds_per" in b:
                 cur["rounds_per"] = int(min(max(int(b["rounds_per"]), 1), 99))
+            if "only" in b:
+                v = str(b["only"] or "auto")
+                if v not in ("auto", "L", "R"):
+                    raise ValueError('bins.only 只能是 "auto"/"L"/"R"')
+                cur["only"] = v
         if "post_grippers" in p:
             pg_in = p["post_grippers"] or {}
             pg = slot.setdefault("post_grippers", {})
@@ -870,16 +879,26 @@ def readiness(cfg: dict | None = None, only: str | None = None) -> dict:
     rb = ra.get("bins") or {}
     if want_r and rb.get("enabled"):
         K = int(rb.get("rounds_per", 2) or 2)
-        warnings.append(f"双仓投放已启用: 每 {K} 轮切一仓交替"
-                        f"(第 1~{K} 轮→左仓,第 {K + 1}~{2 * K} 轮→右仓,"
-                        "如此往复;右臂测试同规则)")
+        only = str(rb.get("only", "auto") or "auto")
+        if only in ("L", "R"):
+            nm = "左仓" if only == "L" else "右仓"
+            warnings.append(f"双仓投放已锁定: 全部轮次只跑{nm}"
+                            "(忽略每仓轮数交替;右臂测试同规则)")
+        else:
+            warnings.append(f"双仓投放已启用: 每 {K} 轮切一仓交替"
+                            f"(第 1~{K} 轮→左仓,第 {K + 1}~{2 * K} 轮→右仓,"
+                            "如此往复;右臂测试同规则)")
         for name in ("B3_transfer", "B4_place", "B5_extra"):
             act = ra["actions"][name]
             if not act["waypoints"]:
                 continue          # 动作整个为空已有上面的提示
+            if only == "L":
+                continue          # 锁定左仓: 不走右仓,尾段空不算风险
             if not ((act.get("bins") or {}).get("tail") or []):
-                warnings.append(f"右臂 {name} 右仓路点未示教:"
-                                "右仓轮将走左仓同一路线(两仓共用点位)"
+                hint = ("锁定右仓但该动作右仓点未示教 —— 将走左仓同一路线"
+                        if only == "R" else
+                        "右仓轮将走左仓同一路线(两仓共用点位)")
+                warnings.append(f"右臂 {name} 右仓路点未示教:{hint}"
                                 " —— 在示教区『➡右仓』列补录")
     # —— 路点级"中点"标记的完整性提示(有标记才查) ——
     for arm, name, want in (("armleft", "A2_place", want_l),
