@@ -41,6 +41,8 @@ const API = {
   poseSvcStart:  () => post('/api/pose_service/start', {}),
   poseSvcStop:   () => post('/api/pose_service/stop', {}),
   poseDetect:    (b) => post('/api/pose_service/detect', b),
+  poseModels:    () => fetch('/api/pose_service/models').then(r => r.json()),
+  poseModelSet:  (b) => post('/api/pose_service/model', b),
   pkConfigGet:   () => fetch('/api/pick/config').then(r => r.json()),
   pkConfigSet:   (b) => post('/api/pick/config', b),
   pkDepthHealth: () => fetch('/api/pick/depth/health').then(r => r.json()),
@@ -1070,6 +1072,48 @@ document.getElementById('pdSvcStop').addEventListener('click', async () => {
   catch (e) { toast('停止失败: ' + e.message, 'error'); }
 });
 
+// ===== 检测模型切换(卫龙袋/海带共用,双臂流水线吸料同享) =====
+let pdModelNames = [], pdModelActive = null;
+async function pdModelRefresh() {
+  const sel = document.getElementById('pdModel');
+  const info = document.getElementById('pdModelInfo');
+  let r;
+  try { r = await API.poseModels(); } catch (e) { info.textContent = ''; return; }
+  const models = r.models || [];
+  const names = models.map(m => m.name);
+  if (names.join(',') !== pdModelNames.join(',')) {   // 条目变了才重建,不打断用户选择
+    sel.innerHTML = models.map(m =>
+      `<option value="${m.name}">${m.label}</option>`).join('');
+    pdModelNames = names;
+  }
+  const act = (models.find(m => m.active) || {}).name || null;
+  if (act !== pdModelActive) {          // 服务端激活项变了才同步下拉框
+    pdModelActive = act;
+    if (act) sel.value = act;
+  }
+  info.textContent = r.alive
+    ? `当前: ${act || r.current || '?'} (imgsz=${r.imgsz})`
+    : '服务未启动,切换时会自动拉起';
+}
+
+document.getElementById('pdModelApply').addEventListener('click', async () => {
+  const sel = document.getElementById('pdModel');
+  const btn = document.getElementById('pdModelApply');
+  if (!sel.value) { toast('没有可选模型', 'error'); return; }
+  btn.disabled = true;
+  toast('切换中(加载+预热 ~10s)...', 'success');
+  try {
+    const r = await API.poseModelSet({ name: sel.value });
+    pdModelActive = sel.value;
+    toast(`已切换: ${String(r.model || sel.value).split('/').pop()} (imgsz=${r.imgsz})`,
+          'success');
+    pdModelRefresh();
+  } catch (e) {
+    toast('切换失败: ' + e.message, 'error');
+  } finally { btn.disabled = false; }
+});
+pdModelRefresh();
+
 let pdTimer = null;
 document.getElementById('pdLoop').addEventListener('change', (e) => {
   if (e.target.checked) {
@@ -1102,7 +1146,7 @@ async function pdDetectOnce() {
 }
 
 // 启动相机后才能检测:轮询健康
-setInterval(pdCheck, 5000);
+setInterval(() => { pdCheck(); pdModelRefresh(); }, 5000);
 pdCheck();
 
 // ===== 一步到位(吸取) =====

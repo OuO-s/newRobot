@@ -29,7 +29,9 @@ WorkingDirectory=/home/user/tianlian/tianlian_webapp
 #  会覆盖系统版本报 CUDNN_STATUS_NOT_INITIALIZED)
 Environment=LD_LIBRARY_PATH=/home/user/tianlian/old/tianlian/yolo11_env/lib/python3.10/site-packages/nvidia/cusparselt/lib
 ExecStartPre=/usr/bin/mkdir -p /home/user/tianlian/tianlian_webapp/logs
-ExecStart=/home/user/tianlian/old/tianlian/yolo11_env/bin/python /home/user/tianlian/tianlian_webapp/pose_service.py --weights /home/user/tianlian/tianlian_webapp/models/weilong_pose_best.pt --port 7100
+# --weights 不钉死: pose_service 按 环境变量 → models/active_model.txt(网页上次选择)
+# → models/weilong_pose_best.pt 顺序解析;网页切换模型后重启机器仍保持选择
+ExecStart=/home/user/tianlian/old/tianlian/yolo11_env/bin/python /home/user/tianlian/tianlian_webapp/pose_service.py --port 7100
 # 崩溃(CUDA OOM 等)5s 后自动拉回; systemctl stop 的 SIGTERM 属干净退出, 不会重启死循环
 Restart=on-failure
 RestartSec=5

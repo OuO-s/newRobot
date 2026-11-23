@@ -89,6 +89,15 @@ _POSE_PORT = 7100
 POSE_YOLO_ENV_PY = "/home/user/tianlian/old/tianlian/yolo11_env/bin/python"
 POSE_YOLO_ENV_SITE = ("/home/user/tianlian/old/tianlian/yolo11_env/"
                       "lib/python3.10/site-packages")
+# 多检测模型: models/ 内 *.pt 可在网页热切换(海带 2026-11-21 新增),
+# 上次选择持久化在 active_model.txt, 物料检测页与双臂流水线吸料共用同一服务。
+POSE_MODELS_DIR = Path(__file__).resolve().parent / "models"
+POSE_POINTER_FILE = POSE_MODELS_DIR / "active_model.txt"
+POSE_MODEL_LABELS = {          # 展示名; 未列出的文件直接显示文件名
+    "weilong_pose_best.pt": "魔芋爽袋 896(卫龙 · 默认)",
+    "weilong_pose_best_20261005_896.pt": "魔芋爽袋 896(10-05 备份)",
+    "haidai_best.pt": "海带(凤池) 640 · 2026-11-21",
+}
 
 # camera_bridge 子进程(ROS2 彩色话题直订阅 → 本地 HTTP 帧服务)。
 # 走它拿原生 640×480 帧;固件 /imageCapture 会把 4:3 硬拉成 1920×1080(畸变),
@@ -486,6 +495,8 @@ def _auto_resume() -> None:
                   f"(interval {interval_ms}ms)", flush=True)
         except Exception as e:                        # noqa: BLE001
             print(f"[auto-resume] 相机 {cam} 恢复失败: {e}", flush=True)
+    # 检测服务若已被 systemd 拉起, 把模型对齐到上次网页选择(热切换自愈)
+    threading.Thread(target=_pose_align_model, daemon=True).start()
 
 
 # ===========================================================================
@@ -2182,6 +2193,103 @@ def pose_service_health():
         return {"alive": False, "port": _POSE_PORT, "reason": str(e)}
 
 
+def _pose_http(path, timeout=2.0, body=None):
+    """:7100 GET/POST(POST 传 JSON); 失败抛异常由调用方处理。"""
+    import urllib.request
+    url = f"http://127.0.0.1:{_POSE_PORT}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json"} if data else {},
+        method="POST" if data is not None else "GET")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def _pose_pointer_name():
+    """上次网页选择的模型文件名; 没选过/文件丢失 → None。"""
+    try:
+        name = POSE_POINTER_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    name = Path(name).name
+    return name if name.endswith(".pt") and (POSE_MODELS_DIR / name).is_file() \
+        else None
+
+
+def _pose_align_model():
+    """把已在跑的 :7100 实例对齐到上次网页选择的模型。
+    场景: 重启/开机后 systemd 单元仍钉着旧权重 → 这里热切换回来(自愈);
+    服务未起/没选过则不动。失败静默(下次启动服务还会再试)。"""
+    name = _pose_pointer_name()
+    if not name:
+        return
+    try:
+        h = _pose_http("/health")
+        cur = Path(h.get("model", "")).name
+        if cur != name:
+            _pose_http("/model", timeout=120.0, body={"name": name})
+            print(f"[pose] 检测模型已从 {cur} 对齐回上次选择 {name}", flush=True)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+@app.get("/api/pose_service/models")
+def pose_service_models():
+    """models/ 内可选权重列表 + 当前加载的模型(物料检测页下拉框用)。"""
+    cur, alive, imgsz = None, False, None
+    try:
+        h = _pose_http("/health")
+        alive, imgsz = True, h.get("imgsz")
+        cur = Path(h.get("model", "")).name
+    except Exception:                                            # noqa: BLE001
+        pass
+    ptr = _pose_pointer_name()
+    models = []
+    if POSE_MODELS_DIR.is_dir():
+        for f in sorted(POSE_MODELS_DIR.glob("*.pt")):
+            models.append({
+                "name": f.name,
+                "label": POSE_MODEL_LABELS.get(f.name, f.name),
+                "size_mb": round(f.stat().st_size / 1e6, 1),
+                "active": f.name == (ptr or cur),
+            })
+    return {"alive": alive, "current": cur, "imgsz": imgsz, "models": models}
+
+
+class PoseModelBody(BaseModel):
+    name: str                     # models/ 内文件名,如 haidai_best.pt
+
+
+@app.post("/api/pose_service/model")
+def pose_service_set_model(body: PoseModelBody):
+    """热切换检测模型(加载+预热 ~10s);选择持久化,双臂流水线吸料同享。"""
+    fn = Path(body.name).name
+    if not fn.endswith(".pt"):
+        raise _err("只允许 models/ 内 .pt 权重文件", 400)
+    if not (POSE_MODELS_DIR / fn).is_file():
+        raise _err(f"模型不存在: models/{fn}", 404)
+    try:                                   # 服务没起先拉起,再热切换
+        _pose_http("/health")
+    except Exception:                                            # noqa: BLE001
+        r = pose_service_start()
+        if not r.get("already_running"):
+            for _ in range(40):           # 首次加载+warmup ~10s
+                time.sleep(1.0)
+                try:
+                    _pose_http("/health")
+                    break
+                except Exception:                                # noqa: BLE001
+                    pass
+    try:
+        r = _pose_http("/model", timeout=120.0, body={"name": fn})
+    except Exception as e:                                       # noqa: BLE001
+        raise _err(f"切换失败: {e}", 502)
+    if not r.get("ok"):
+        raise _err(r.get("error", "未知错误"), 500)
+    return r
+
+
 @app.post("/api/pose_service/start")
 def pose_service_start():
     global _POSE_PROC
@@ -2192,6 +2300,7 @@ def pose_service_start():
         with urllib.request.urlopen(f"http://127.0.0.1:{_POSE_PORT}/health",
                                     timeout=1.0) as r:
             if r.status == 200:
+                _pose_align_model()         # systemd 实例可能钉着旧权重,拉齐
                 return {"ok": True, "already_running": True,
                         "external": True, "port": _POSE_PORT}
     except Exception:                                          # noqa: BLE001
@@ -2201,7 +2310,12 @@ def pose_service_start():
     script = Path(__file__).resolve().with_name("pose_service.py")
     if not script.is_file():
         raise _err(f"pose_service.py 不存在: {script}", 500)
-    weights = script.parent / "models" / "weilong_pose_best.pt"
+    weights = None
+    ptr = _pose_pointer_name()              # 上次网页选择的模型优先
+    if ptr:
+        weights = POSE_MODELS_DIR / ptr
+    else:
+        weights = POSE_MODELS_DIR / "weilong_pose_best.pt"
     if not weights.is_file():
         # 兜底: 本地没拷权重时用 upper_computer 的源文件(日志会提示)
         alt = Path(os.environ.get(

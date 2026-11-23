@@ -334,7 +334,13 @@
           <button id="pdSvcStart" class="primary">启动服务</button>
           <button id="pdSvcStop">停止服务</button>
         </div>
-        <p class="muted">服务位于 yolo11_env 解释器(独立 GPU 进程);首次启动 ~10s。</p>
+        <div class="row" style="margin-top:8px;">
+          <label>检测模型 <select id="pdModel"></select></label>
+          <button id="pdModelApply">🔄 切换模型</button>
+          <span id="pdModelInfo" class="muted"></span>
+        </div>
+        <p class="muted">服务位于 yolo11_env 解释器(独立 GPU 进程);首次启动 ~10s。
+          切换模型需加载+预热(~10s),选择持久化,对『双臂流水线』的吸料检测同样生效。</p>
       </div>
       <div class="card">
         <h3>检测</h3>
@@ -682,7 +688,8 @@
         <h3>🦾 左臂:视觉吸料 → 放中间件</h3>
         <p class="muted">
           吸料部分<b>全由视觉自动执行</b>(与『物料检测』页一步到位同款:参数、吸真空方式
-          沿用其设置;扫描位也在该页示教)。每轮循环执行顺序:<br>
+          沿用其设置;扫描位也在该页示教;检测模型也用该页当前所选,卫龙袋/海带共用同一服务)。
+          每轮循环执行顺序:<br>
           <b>① 物料检测(自动:回扫描位 → YOLO+深度 → 基座系定位选袋)
           → ② 移动到物料上方(自动:升越顶 → 转对准姿态 → 水平平移)
           → ③ 下降+下压(自动:降到袋面,沿吸嘴轴向压入)

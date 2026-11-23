@@ -15,6 +15,11 @@ PySide6), 两边解释器不可互换。本服务由 GUI 作为子进程拉起, 
 
 接口(默认 127.0.0.1:7100):
   GET  /health           → {"ok":true,"model":...,"device":...,"imgsz":896}
+  GET  /models           → {"ok":true,"models":[{name,size_mb,mtime}...],
+                            "current":..., "active_pointer":...}
+  POST /model {"name":"haidai_best.pt"}
+                         → 热切换 models/ 内权重(加载+预热 ~10s),
+                           选择持久化到 models/active_model.txt(重启后仍生效)
   POST /detect?conf=0.25 → body=图片字节(JPEG/PNG)
                            → {"ok":true,"latency_ms":...,"detections":[...]}
     detection 字段: conf, cls(front/back), cls_prob, box[xyxy], kpts[[x,y]×4],
@@ -30,6 +35,7 @@ import argparse
 import base64
 import json
 import math
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -39,8 +45,61 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
+# 兜底类别名(旧卫龙 ckpt); 实际类别从各 ckpt 的 model.names 读,
+# 海带模型(2026-11-21)是 fengchi_front/fengchi_back, 类别索引同构(0=正 1=反)。
 CLS_NAMES = ["front", "back"]
 UP_TOL_DEG = 30.0          # 头部方向与图像上方夹角阈值, 小于视为"朝上"
+
+# 多模型支持: models/ 内 *.pt 均可通过 /model 热切换,
+# 上次选择记在 active_model.txt, 重启(含 systemd 自启)后仍生效。
+_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+_POINTER_FILE = os.path.join(_MODELS_DIR, "active_model.txt")
+_RELOAD_LOCK = threading.Lock()
+
+
+def _active_pointer():
+    """返回 (模型文件名, 绝对路径); 没选过/文件已丢 → (None, None)。"""
+    try:
+        with open(_POINTER_FILE, encoding="utf-8") as f:
+            name = os.path.basename(f.read().strip())
+        p = os.path.join(_MODELS_DIR, name)
+        if name.endswith(".pt") and os.path.isfile(p):
+            return name, p
+    except OSError:
+        pass
+    return None, None
+
+
+def _write_pointer(name):
+    try:
+        with open(_POINTER_FILE, "w", encoding="utf-8") as f:
+            f.write(name)
+    except OSError as e:
+        print(f"[pose_service] 写 active_model.txt 失败: {e}", flush=True)
+
+
+def _resolve_model(name):
+    """模型名 → models/ 内绝对路径; 拒绝越界(../ 、绝对路径、非 .pt)。"""
+    fn = os.path.basename(str(name or ""))
+    p = os.path.abspath(os.path.join(_MODELS_DIR, fn))
+    if (not fn.endswith(".pt") or os.path.dirname(p) != _MODELS_DIR
+            or not os.path.isfile(p)):
+        return None
+    return p
+
+
+def _list_models():
+    out = []
+    try:
+        for fn in sorted(os.listdir(_MODELS_DIR)):
+            if fn.endswith(".pt"):
+                st = os.stat(os.path.join(_MODELS_DIR, fn))
+                out.append({"name": fn, "size_mb": round(st.st_size / 1e6, 1),
+                            "mtime": time.strftime("%Y-%m-%d %H:%M",
+                                                   time.localtime(st.st_mtime))})
+    except OSError:
+        pass
+    return out
 
 
 class Detector:
@@ -52,6 +111,7 @@ class Detector:
         self.conf, self.imgsz = conf, imgsz
         self.lock = threading.Lock()
         self.weights = weights
+        self.cls_names = self._load_cls_names()
         self.warmup_ms = 0.0
         t0 = time.time()
         with self.lock:                       # 预热: 首次推理含 CUDA 上下文创建
@@ -59,6 +119,19 @@ class Detector:
                                imgsz=imgsz, device=self.device,
                                conf=conf, verbose=False)
         self.warmup_ms = (time.time() - t0) * 1000
+
+    def _load_cls_names(self):
+        """类别名从 ckpt 读(海带模型是 fengchi_front/fengchi_back),
+        读不到退回旧卫龙硬编码。索引语义两代一致: 0=正面 1=反面。"""
+        names = getattr(self.model, "names", None)
+        try:
+            if isinstance(names, dict) and names:
+                return [str(names[i]) for i in range(len(names))]
+            if isinstance(names, (list, tuple)) and names:
+                return [str(n) for n in names]
+        except Exception:                                   # noqa: BLE001
+            pass
+        return list(CLS_NAMES)
 
     def detect(self, bgr, conf=None):
         conf = conf or self.conf
@@ -72,7 +145,8 @@ class Detector:
             kpts = (res.keypoints.xy[i].cpu().numpy()
                     if res.keypoints is not None else None)
             item = {"conf": float(res.boxes.conf[i]),
-                    "cls": CLS_NAMES[ci] if ci < len(CLS_NAMES) else str(ci),
+                    "cls": (self.cls_names[ci]
+                            if ci < len(self.cls_names) else str(ci)),
                     "cls_prob": None,
                     "box": [float(v) for v in box],
                     "kpts": [[float(x), float(y)] for x, y in kpts]
@@ -105,9 +179,10 @@ def head_dev_deg(item):
 
 
 def orient_action(item, up_tol=UP_TOL_DEG):
-    """整姿决策: 反面→翻面; 正面但头部不朝上→调转; 正面且朝上→就绪"""
+    """整姿决策: 反面→翻面; 正面但头部不朝上→调转; 正面且朝上→就绪
+    (类别名用 endswith 判正反: back/fengchi_back 都算反面,两代模型通用)"""
     dev, head_up = head_dev_deg(item)
-    if item["cls"] == "back":
+    if str(item.get("cls", "")).endswith("back"):
         return {"action": "flip", "head_up": head_up,
                 "head_dev_deg": dev, "rotate_deg": None}
     if dev is None:
@@ -150,7 +225,8 @@ def draw_detections(img, detections, numbers=False):
     numbers=True 时再画检测序号 #n(与响应 detections 列表顺序一致,供吸取选袋)。"""
     vis = img.copy()
     for n, d in enumerate(detections, 1):
-        color = _CLR_FRONT if d.get("cls") == "front" else _CLR_BACK
+        color = (_CLR_FRONT if str(d.get("cls", "")).endswith("front")
+                 else _CLR_BACK)
         x1, y1, x2, y2 = [int(v) for v in d["box"]]
         cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
         if numbers:
@@ -204,13 +280,66 @@ class Handler(BaseHTTPRequestHandler):
             d = self.detector
             self._send(200, {"ok": True, "model": d.weights,
                              "device": d.device, "imgsz": d.imgsz,
-                             "classes": CLS_NAMES,
+                             "classes": d.cls_names,
                              "warmup_ms": round(d.warmup_ms, 1)})
+        elif self.path.startswith("/models"):
+            d = self.detector
+            aname, _ = _active_pointer()
+            self._send(200, {"ok": True, "models": _list_models(),
+                             "current": (os.path.basename(d.weights)
+                                         if d else None),
+                             "active_pointer": aname,
+                             "imgsz": d.imgsz if d else None})
         else:
             self._send(200, {"ok": True, "service": "pose",
-                             "endpoints": ["/health", "/detect"]})
+                             "endpoints": ["/health", "/detect",
+                                           "/models", "/model"]})
+
+    def _read_json(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if not n:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n).decode("utf-8"))
+        except Exception:                                   # noqa: BLE001
+            return {}
+
+    def _swap_model(self, body):
+        """热切换: 新 Detector 建好再原子换引用,推理无缝;选择落盘。"""
+        p = _resolve_model((body or {}).get("name"))
+        if not p:
+            self._send(400, {"ok": False,
+                             "error": f"未知模型: {(body or {}).get('name')!r}"
+                                      "(只允许 models/ 内 .pt 权重)"})
+            return
+        with _RELOAD_LOCK:
+            old = Handler.detector
+            if old and os.path.abspath(old.weights) == p:
+                _write_pointer(os.path.basename(p))
+                self._send(200, {"ok": True, "already_active": True,
+                                 "model": old.weights, "imgsz": old.imgsz,
+                                 "classes": old.cls_names})
+                return
+            try:
+                t0 = time.time()
+                nd = Detector(p, device=old.device if old else "cuda:0",
+                              imgsz=_train_imgsz(p))
+            except Exception as e:                           # noqa: BLE001
+                self._send(500, {"ok": False, "error": f"加载失败: {e}"})
+                return
+            Handler.detector = nd          # 原子换引用,在途请求继续用旧实例
+            del old                        # 释放旧权重显存
+            _write_pointer(os.path.basename(p))
+            print(f"[pose_service] 模型已切换 → {p} (imgsz={nd.imgsz}, "
+                  f"加载+预热 {time.time() - t0:.1f}s)", flush=True)
+            self._send(200, {"ok": True, "model": nd.weights,
+                             "imgsz": nd.imgsz, "classes": nd.cls_names,
+                             "warmup_ms": round(nd.warmup_ms, 1)})
 
     def do_POST(self):
+        if self.path.startswith("/model"):
+            self._swap_model(self._read_json())
+            return
         if not self.path.startswith("/detect"):
             self._send(404, {"ok": False, "error": "not found"})
             return
@@ -251,19 +380,20 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _default_weights():
-    """权重三级查找: 环境变量 → webapp 本地 models/ → upper_computer 源路径。
-    webapp 要求整目录可拷贝复用,正常应走前两级;第三级只是兜底并在日志提示。"""
-    import os
-    here = os.path.dirname(os.path.abspath(__file__))
+    """权重查找: 环境变量 → 上次网页选择(active_model.txt) → models/ 卫龙默认
+    → upper_computer 源路径。webapp 要求整目录可拷贝复用,正常应走前三者;
+    最后一级只是兜底并在日志提示。"""
+    _, ptr = _active_pointer()
     cands = [
         os.environ.get("POSE_WEIGHTS", ""),
-        os.path.join(here, "models", "weilong_pose_best.pt"),
+        ptr or "",
+        os.path.join(_MODELS_DIR, "weilong_pose_best.pt"),
         "/home/user/tianlian/upper_computer/models/weilong_pose_best.pt",
     ]
     for p in cands:
         if p and os.path.isfile(p):
             return p
-    return cands[1]      # 都不存在时返回本地路径,让上层报出可读的错
+    return cands[2]      # 都不存在时返回本地路径,让上层报出可读的错
 
 
 def _train_imgsz(weights):
@@ -277,7 +407,6 @@ def _train_imgsz(weights):
 
 
 def main():
-    import os
     ap = argparse.ArgumentParser()
     ap.add_argument("--weights", default=_default_weights())
     ap.add_argument("--port", type=int, default=7100)
